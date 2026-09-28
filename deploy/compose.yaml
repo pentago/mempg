@@ -1,0 +1,87 @@
+services:
+  pgvector:
+    container_name: pgvector
+    hostname: pgvector
+    image: pgvector/pgvector:0.8.6-pg18-trixie
+    user: ${PUID}:${PGID}
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: ${PG_DB}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    networks:
+      - db
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${PG_USER}", "-d", "${PG_DB}"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  ollama:
+    container_name: ollama
+    hostname: ollama
+    image: ollama/ollama:0.34.2
+    user: ${PUID}:${PGID}
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    environment:
+      HOME: /models
+      OLLAMA_MODELS: /models
+    volumes:
+      - ./ollama-models:/models
+    ports:
+      - "127.0.0.1:11434:11434"
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 4G
+        # GPU reservations go here when nvidia-container-toolkit is installed:
+        # reservations:
+        #   devices:
+        #     - driver: nvidia
+        #       capabilities: [gpu]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "ollama", "ls"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  db:
+    driver: bridge

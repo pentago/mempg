@@ -1,0 +1,60 @@
+name: Check
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.6-pg18-trixie
+        env:
+          POSTGRES_USER: mempguser
+          POSTGRES_PASSWORD: mempgpass
+          POSTGRES_DB: mempg
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mempguser -d mempg"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bunx biome check .
+
+      - name: Typecheck
+        run: bunx tsc --noEmit
+
+      - name: Bootstrap schema
+        run: |
+          docker run --rm --network=host \
+            -e PGPASSWORD=mempgpass \
+            -e PGHOST=localhost \
+            -e POSTGRES_USER=mempguser \
+            -e POSTGRES_DB=mempg \
+            -v "$PWD/deploy/init:/init:ro" \
+            pgvector/pgvector:0.8.6-pg18-trixie /init/01-init.sh
+
+      - name: Test
+        env:
+          MEMPG_HOST: localhost
+          MEMPG_PORT: "5432"
+          MEMPG_USER: mempguser
+          MEMPG_PASSWORD: mempgpass
+          MEMPG_DB: mempg
+        run: bun test

@@ -1,0 +1,24 @@
+repos:
+  - repo: local
+    hooks:
+      - id: biome-check
+        name: biome check
+        entry: bunx biome check .
+        language: system
+        files: \.ts$
+        pass_filenames: false
+
+      - id: tsc
+        name: tsc --noEmit
+        entry: bunx tsc --noEmit
+        language: system
+        files: \.ts$
+        pass_filenames: false
+
+      - id: tag-version-match
+        name: tag matches package.json version
+        entry: scripts/check-tag-version.sh
+        language: system
+        stages: [pre-push]
+        always_run: true
+        pass_filenames: false

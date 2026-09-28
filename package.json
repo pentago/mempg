@@ -1,0 +1,46 @@
+{
+  "name": "@dzhi/mempg",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Postgres-backed persistent memory extension for oh-my-pi (omp)",
+  "main": "mempg.ts",
+  "scripts": {
+    "check": "biome check .",
+    "format": "biome format --write .",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "bench:mempg-shaped-consolidate": "bun bench/mempg-shaped-consolidate.ts",
+    "bench:embeddinggemma-calibration": "bun bench/embeddinggemma-calibration.ts",
+    "backfill": "bun deploy/backfill.ts"
+  },
+  "exports": {
+    ".": "./mempg.ts"
+  },
+  "files": [
+    "mempg.ts"
+  ],
+  "omp": {
+    "extensions": [
+      "./mempg.ts"
+    ]
+  },
+  "keywords": [
+    "omp-plugin",
+    "oh-my-pi",
+    "omp",
+    "postgres",
+    "memory"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pentago/mempg.git"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.14",
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2",
+    "@oh-my-pi/pi-coding-agent": "^18.3.5",
+    "@oh-my-pi/omptype": "^18.3.5"
+  }
+}
