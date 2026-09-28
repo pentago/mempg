@@ -159,6 +159,32 @@ describe("sqlite backend", () => {
     expect(row.superseded_by).toBeNull();
   });
 
+  // One SQLite connection: overlapping transactions used to fail, and a write
+  // issued during a refused supersede was rolled back with it.
+  test("parallel writes, including supersedes and a refused one, each succeed or fail on their own", async () => {
+    const [d, other] = [dir(), dir()];
+    const ctx = { directory: d, sessionID: "t" };
+    const olds = [await store("zzpar old fact one.", d), await store("zzpar old fact two.", d)];
+    const foreign = await store("zzpar foreign project fact.", other);
+    const out = await Promise.all([
+      __internals.remember({ content: "zzpar new fact one.", supersedes: olds[0] }, ctx),
+      __internals.remember({ content: "zzpar new fact two.", supersedes: olds[1] }, ctx),
+      __internals.remember({ content: "zzpar refused takeover.", supersedes: foreign }, ctx),
+      __internals.remember({ content: "zzpar plain fact." }, ctx),
+    ]);
+    expect(out[2]).toContain("cannot supersede");
+    for (const i of [0, 1, 3]) expect(out[i]).toMatch(/^Stored memory #\d+/);
+    const rows = (await sql`SELECT content FROM memories WHERE content LIKE 'zzpar%' ORDER BY content`) as { content: string }[];
+    expect(rows.map((r) => r.content)).toEqual([
+      "zzpar foreign project fact.", "zzpar new fact one.", "zzpar new fact two.",
+      "zzpar old fact one.", "zzpar old fact two.", "zzpar plain fact.",
+    ]);
+    const [{ n: linked }] = (await sql`SELECT count(*) AS n FROM memories WHERE id IN (${olds[0]}, ${olds[1]}) AND superseded_by IS NOT NULL`) as {
+      n: number;
+    }[];
+    expect(linked).toBe(2);
+  });
+
   test("update rewrites content, the keyword index, tags and updated_at but keeps created_at", async () => {
     const d = dir();
     const id = await store("zzupd original wording about quokkas.", d, { tags: ["a"] });

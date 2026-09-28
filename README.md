@@ -114,7 +114,7 @@ When something fails, it degrades instead of blocking: with Ollama down it searc
 
 ### Corrections (`supersedes`)
 
-`memory_remember` with `supersedes: <id>` saves the new memory and marks the old one as replaced, in one transaction. If the old one can't be marked, for example because it belongs to another project, nothing is saved.
+`memory_remember` with `supersedes: <id>` saves the new memory and marks the old one as replaced. If the old one can't be marked, for example because it belongs to another project, nothing is saved.
 
 A replaced memory is hidden from recall, injection and cleanup, but not deleted. `memory_recall` with `includeSuperseded: true` shows it and what replaced it. Deleting the newer memory makes the old one current again.
 

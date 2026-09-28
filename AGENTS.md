@@ -89,7 +89,7 @@ pre-commit install && pre-commit install --hook-type pre-push
 - **Write caps**:
   - Content is 10-4000 chars; at most 10 tags, each up to 64 chars. These are abuse guards: reject with the actual size, never truncate.
   - A write over 700 chars gets a non-blocking nudge.
-- **Supersede**: `memory_remember`'s `supersedes` inserts and links in one `sql.begin` transaction. A bad link rolls back the whole write.
+- **Supersede**: `memory_remember`'s `supersedes` is checked inside the INSERT (`INSERT … SELECT … WHERE EXISTS`), so an unreachable target saves nothing. If the target changes before the link UPDATE, the new row is deleted again. The extension uses no `sql.begin`: on Bun's single SQLite connection, overlapping transactions fail, and any other query run while one is open joins it and is rolled back with it.
 - **Injection**:
   - Always extend `event.systemPrompt`, never `ctx.getSystemPrompt()`.
   - Read `ctx.cwd` per event, because `/move` changes it.
