@@ -1,6 +1,6 @@
 # mempg
 
-Long-term memory for [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) agents, stored in your own Postgres.
+Long-term memory for [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) agents, stored in your own Postgres or in a local SQLite file.
 
 ## What it does
 
@@ -11,11 +11,13 @@ An omp agent normally forgets everything when a session ends. mempg gives it a m
 - **Keeps projects apart.** Facts about one project stay in that project. Facts about your tools in general are shared everywhere.
 - **Handles corrections.** A new memory can replace an old one, so outdated facts stop showing up.
 - **Never gets in the way.** If the database or the search model is down, the agent keeps working without memory.
-- **Runs on infrastructure you control.** Your Postgres and your Ollama model, local or remote. No third-party service or API key.
+- **Runs on infrastructure you control.** Your Postgres (or a SQLite file) and your Ollama model, local or remote. No third-party service or API key.
 
 ## Quick start
 
-1. **Get a database.** Postgres with the `pg_trgm` and `vector` extensions. [`deploy/`](./deploy) has a ready Docker Compose setup, with an optional Ollama service for search by meaning. See [`deploy/README.md`](./deploy/README.md).
+1. **Get a database.** Postgres with the `vector` extension. [`deploy/`](./deploy) has a ready Docker Compose setup, with an optional Ollama service for search by meaning. See [`deploy/README.md`](./deploy/README.md).
+
+   **Or skip the server:** set `MEMPG_BACKEND=sqlite` and mempg keeps everything in one file, `~/.omp/agent/mempg.sqlite`, created on first use. Moving existing memories over: `bun run port:sqlite` (see [`deploy/README.md`](./deploy/README.md#sqlite-instead-of-postgres)).
 2. **Install the plugin:**
 
    ```bash
@@ -23,7 +25,7 @@ An omp agent normally forgets everything when a session ends. mempg gives it a m
    ```
 
    Or try it from a checkout for one run: `omp -e ./mempg.ts`.
-3. **Point it at the database** with environment variables:
+3. **Point it at the database** with environment variables (Postgres only):
 
    ```bash
    export MEMPG_HOST=localhost MEMPG_USER=mempguser MEMPG_DB=mempg
@@ -38,6 +40,8 @@ All settings are environment variables. There are no plugin options.
 
 | Variable            | Default               | Notes                                                                 |
 | ------------------- | --------------------- | --------------------------------------------------------------------- |
+| `MEMPG_BACKEND`     | `pgvector`            | `sqlite` stores memories in a local file instead of Postgres          |
+| `MEMPG_SQLITE_PATH` | `~/.omp/agent/mempg.sqlite` | SQLite only; the directory must exist                           |
 | `MEMPG_HOST`        | `localhost`           |                                                                       |
 | `MEMPG_PORT`        | `5432`                |                                                                       |
 | `MEMPG_USER`        | `mempguser`           |                                                                       |
@@ -65,7 +69,7 @@ Errors and fallbacks go to the omp log in `~/.omp/logs/`, never to your terminal
 
 ## How it works
 
-Every memory is a row in one Postgres table, `memories`.
+Every memory is a row in one table, `memories`, in Postgres or in the SQLite file.
 
 ### Memory types
 
@@ -75,7 +79,6 @@ The type decides where a memory is visible:
 | ------------------------ | ------------------- | ------------------------------------------------------------------------ |
 | `project_fact` (default) | Its own project only | Facts about this project or customer ("customer A's staging DNS is flaky") |
 | `stack_fact`             | Everywhere          | Facts about your tools ("our Terraform RDS module needs `ignore_changes`") |
-| `episodic`               | Everywhere          | Reserved for a future feature; nothing sets it automatically              |
 
 A rule of thumb: would this help in another customer's repo that uses the same tools? Yes means `stack_fact`.
 
@@ -93,7 +96,7 @@ Limits: 10-4000 characters and up to 10 tags. Too-large writes are rejected, not
 
 ### How memories come back
 
-Before each agent run, mempg searches with your prompt by keyword (Postgres full-text) and by meaning (pgvector embeddings), and merges the results. Near-duplicates are dropped, and the top 5 go into the system prompt, each shortened and labelled with its project. If nothing matches, the newest memories are used instead.
+Before each agent run, mempg searches with your prompt by keyword (Postgres full-text, or SQLite FTS5) and by meaning (embeddings: pgvector on Postgres, compared in the plugin on SQLite), and merges the results. Near-duplicates are dropped, and the top 5 go into the system prompt, each shortened and labelled with its project. If nothing matches, the newest memories are used instead.
 
 When something fails, it degrades instead of blocking: with Ollama down it searches by keyword only, and with the database down or slow (1-second deadline) the agent simply gets no memories.
 
@@ -129,10 +132,11 @@ A pair that matches by meaning but differs in a number, path or name (a rate lim
 bun install
 bun run check      # lint (Biome)
 bun run typecheck  # tsc --noEmit
-bun test           # integration tests, need Postgres with pg_trgm + vector
+bun test           # integration tests, need Postgres with pgvector
+bun run test:sqlite  # the SQLite backend, against a throwaway /tmp file
 pre-commit install && pre-commit install --hook-type pre-push
 ```
 
 The hooks run lint and typecheck on commit, and check that a pushed tag matches the `package.json` version. `bun test` writes to the database it's pointed at, so use a throwaway one. CI runs it against a fresh Postgres container.
 
-Upgrading an existing database: see [`deploy/README.md`](./deploy/README.md#upgrading-an-existing-install). Threshold benchmarks for cleanup live in [`bench/`](./bench/README.md).
+Upgrading an existing database: see [`deploy/README.md`](./deploy/README.md#upgrading-an-existing-install). Benchmarks, including a Postgres-vs-SQLite comparison, live in [`bench/`](./bench/README.md).

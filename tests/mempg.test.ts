@@ -348,23 +348,6 @@ describe("DB access layer", () => {
       expect(await __internals.forget({ id: -3 }, ctx)).toContain("positive integer");
     });
 
-    test("QA failure: a database without pg_trgm gets an actionable error, not a generic one", async () => {
-      // Upgrading an existing install is the realistic way to hit this, and the
-      // generic message would send the operator hunting through server logs.
-      const missing = Object.assign(new Error("function similarity(text, text) does not exist"), {
-        name: "PostgresError",
-        errno: 42883,
-      });
-      __internals.resetRateLimit();
-      const spy = spyOn(console, "error").mockImplementation(() => {});
-      try {
-        expect(__internals.toolError("remember", "remember", missing)).toContain("CREATE EXTENSION pg_trgm");
-      } finally {
-        spy.mockRestore();
-        __internals.resetRateLimit();
-      }
-    });
-
     test("QA happy: remember inserts a row with a proper tags array and returns its id", async () => {
       const marker = `test-insert-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const content = `Insert path test: ${marker}`;
@@ -439,12 +422,12 @@ describe("DB access layer", () => {
   describe("memory_type", () => {
     const ctx = { directory: "/tmp/mempg-test-type", sessionID: "type-t" };
 
-    test("remember defaults to project_fact and accepts an explicit episodic type", async () => {
+    test("remember defaults to project_fact and accepts an explicit stack_fact type", async () => {
       try {
         const fact = await __internals.remember({ content: "The make target is make verify, not make test." }, ctx);
         expect(fact).toContain("Stored memory #");
         const ep = await __internals.remember(
-          { content: "The operator prefers short commit subjects.", type: "episodic" },
+          { content: "The operator prefers short commit subjects.", type: "stack_fact" },
           ctx,
         );
         expect(ep).toContain("Stored memory #");
@@ -453,7 +436,7 @@ describe("DB access layer", () => {
           SELECT content, memory_type FROM memories WHERE project = ${ctx.directory}
         ` as { content: string; memory_type: string }[];
         expect(rows.find((r) => r.content.startsWith("The make target"))?.memory_type).toBe("project_fact");
-        expect(rows.find((r) => r.content.startsWith("The operator prefers"))?.memory_type).toBe("episodic");
+        expect(rows.find((r) => r.content.startsWith("The operator prefers"))?.memory_type).toBe("stack_fact");
       } finally {
         await purge(ctx.directory);
       }
@@ -465,7 +448,7 @@ describe("DB access layer", () => {
         ctx,
       );
       expect(result).toContain("ERROR");
-      expect(result).toContain("stack_fact, project_fact, episodic");
+      expect(result).toContain("stack_fact, project_fact.");
       const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${ctx.directory}` as { n: string }[];
       expect(Number(n.n)).toBe(0);
     });
@@ -494,9 +477,9 @@ describe("DB access layer", () => {
 
     test("recall surfaces non-default types in its output", async () => {
       try {
-        await __internals.remember({ content: "Episodic type surfaced in recall output.", type: "episodic" }, ctx);
+        await __internals.remember({ content: "Stack type surfaced in recall output.", type: "stack_fact" }, ctx);
         const result = await __internals.recall({ query: "surfaced in recall", limit: 2 }, ctx);
-        expect(result).toContain("[episodic]");
+        expect(result).toContain("[stack_fact]");
       } finally {
         await purge(ctx.directory);
       }
@@ -539,15 +522,15 @@ describe("DB access layer", () => {
 
     test("explicit tags and type replace the stored ones", async () => {
       try {
-        const id = await storeId("A memory that will be retyped as episodic.", ctx.directory);
+        const id = await storeId("A memory that will be retyped as stack_fact.", ctx.directory);
         expect(
-          await __internals.updateMemory({ id, content: "Retyped as episodic.", type: "episodic" }, ctx),
+          await __internals.updateMemory({ id, content: "Retyped as stack_fact.", type: "stack_fact" }, ctx),
         ).toBe(`Updated memory #${id}.`);
         const [row] = await __internals.sql`SELECT memory_type, tags FROM memories WHERE id = ${id}` as {
           memory_type: string;
           tags: string[];
         }[];
-        expect(row.memory_type).toBe("episodic");
+        expect(row.memory_type).toBe("stack_fact");
         expect(row.tags).toEqual([]);
       } finally {
         await purge(ctx.directory);
@@ -591,7 +574,7 @@ describe("DB access layer", () => {
       expect(await __internals.updateMemory({ id: -1, content: "valid content here" }, ctx)).toContain("positive integer");
       expect(await __internals.updateMemory({ id: 1, content: "short" }, ctx)).toContain("at least 10 characters");
       expect(await __internals.updateMemory({ id: 1, content: "valid content here", type: "nope" as unknown as "project_fact" }, ctx)).toContain(
-        "stack_fact, project_fact, episodic",
+        "stack_fact, project_fact.",
       );
     });
 
@@ -607,43 +590,6 @@ describe("DB access layer", () => {
         const after = await inject(ctx.directory);
         expect(after).toContain(`Rewritten note ${marker}`);
         expect(after).not.toContain("Original note");
-      } finally {
-        await purge(ctx.directory);
-      }
-    });
-  });
-
-  describe("access tracking (recall-only)", () => {
-    const ctx = { directory: "/tmp/mempg-test-access", sessionID: "access-t" };
-
-    test("recall bumps access_count + last_accessed_at of returned rows", async () => {
-      const marker = `zzzaccess${Date.now()}`;
-      try {
-        const id = await storeId(`Access tracking probe ${marker} for the recall bump.`, ctx.directory);
-        // Queried recall, not a browse: the live corpus fills the undirected
-        // top-5, so the fixture would never be a returned row to bump.
-        await __internals.recall({ query: marker }, ctx);
-        await __internals.recall({ query: marker }, ctx);
-        // Fire-and-forget: give the abandoned UPDATE a beat to land.
-        await new Promise((r) => setTimeout(r, 50));
-        const [row] = await __internals.sql`
-          SELECT access_count, last_accessed_at FROM memories WHERE id = ${id}
-        ` as { access_count: number; last_accessed_at: Date | null }[];
-        expect(row.access_count).toBe(2);
-        expect(row.last_accessed_at).not.toBe(null);
-      } finally {
-        await purge(ctx.directory);
-      }
-    });
-
-    test("the injection path stays read-only", async () => {
-      try {
-        const id = await storeId("Injection must not touch access stats.", ctx.directory);
-        __internals.invalidateInjection(ctx.directory);
-        expect(await inject(ctx.directory)).not.toBe("");
-        await new Promise((r) => setTimeout(r, 50));
-        const [row] = await __internals.sql`SELECT access_count FROM memories WHERE id = ${id}` as { access_count: number }[];
-        expect(row.access_count).toBe(0);
       } finally {
         await purge(ctx.directory);
       }
@@ -667,7 +613,7 @@ describe("DB access layer", () => {
         ` as { session_id: string }[];
         // Three recalls from the SAME session must collapse to one row - the
         // PRIMARY KEY on (memory_id, session_id) is what makes repeat
-        // exposure within a session not compound, unlike access_count.
+        // exposure within a session not compound.
         expect(rows.length).toBe(1);
         expect(rows[0].session_id).toBe(ctx.sessionID);
       } finally {
@@ -865,15 +811,6 @@ describe("DB access layer", () => {
 
       await __internals.forget({ id }, ctx);
       expect(await inject(ctx.directory, p1)).not.toContain("Deploy gate note");
-    });
-
-    test("injection stays read-only in relevance mode too", async () => {
-      const id = await storeId("Read-only probe for relevance injection.", ctx.directory);
-      __internals.invalidateInjection(ctx.directory);
-      await inject(ctx.directory, ask("read-only probe for relevance injection"));
-      await new Promise((r) => setTimeout(r, 50));
-      const [row] = await __internals.sql`SELECT access_count FROM memories WHERE id = ${id}` as { access_count: number }[];
-      expect(row.access_count).toBe(0);
     });
 
     test("MEMPG_INJECTION=recency keeps the old behavior and ignores the prompt", async () => {
@@ -1294,6 +1231,21 @@ describe("DB access layer", () => {
         await purge(ctx.directory);
       }
     });
+
+    test.skipIf(!vectorReady)("memory_update clears the old vector, so a failed re-embed leaves the row keyword-only", async () => {
+      try {
+        const id = await storeId(`Stale-vector probe zzzstale${Date.now()} before the edit.`, ctx.directory);
+        // A known vector stands in for the old content's embedding.
+        await __internals.sql`UPDATE memories SET embedding = array_fill(0.1, ARRAY[768])::vector WHERE id = ${id}`;
+        await withOllamaDown(async () => {
+          await __internals.updateMemory({ id, content: "Stale-vector probe after the edit, with new content." }, ctx);
+          const [row] = await __internals.sql`SELECT embedding IS NULL AS cleared FROM memories WHERE id = ${id}` as { cleared: boolean }[];
+          expect(row.cleared).toBe(true);
+        });
+      } finally {
+        await purge(ctx.directory);
+      }
+    });
   });
 
   describe("consolidate: embedding-based pass (meaning-level duplicates)", () => {
@@ -1502,17 +1454,16 @@ describe("DB access layer", () => {
     });
   });
 
-  describe("consolidate: isTemplatedAutoLog predicate (regression, no embeddings needed)", () => {
-    // Permanent regression net for the exclusion predicate itself: runs the
-    // exact SQL fragment consolidate() uses (via __internals.isTemplatedAutoLog),
-    // against representative strings pulled from the 2026-09-19 real-corpus
-    // audit - so a future refactor of the predicate is caught here even
-    // without a live Ollama/pgvector setup (no hybridReady gate, no writes).
+  describe("consolidate: templated auto-log predicate (regression, no embeddings needed)", () => {
+    // Permanent regression net for the exclusion predicate, against
+    // representative real-corpus strings. Runs both copies - the TS row filter
+    // and Postgres' SQL pair prefilter - so the two cannot drift apart.
     const matches = async (content: string): Promise<boolean> => {
       const [row] = await __internals.sql`
-        SELECT ${__internals.isTemplatedAutoLog(__internals.sql)} AS matches
-        FROM (SELECT ${content}::text AS content) AS t
+        SELECT ${__internals.isTemplatedAutoLogPair(__internals.sql)} AS matches
+        FROM (SELECT ${content}::text AS content) AS a, (SELECT ''::text AS content) AS b
       ` as { matches: boolean }[];
+      expect(row.matches).toBe(__internals.isTemplatedContent(content));
       return row.matches;
     };
 

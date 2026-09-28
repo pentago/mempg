@@ -58,3 +58,6 @@ jobs:
           MEMPG_PASSWORD: mempgpass
           MEMPG_DB: mempg
         run: bun test
+
+      - name: Test (SQLite backend)
+        run: bun run test:sqlite

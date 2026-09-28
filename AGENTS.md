@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-mempg is a **single-file** oh-my-pi (omp) extension (`mempg.ts`). It gives agents persistent memory backed by Postgres (`pg_trgm` + `pgvector`), with optional Ollama embeddings.
+mempg is a **single-file** oh-my-pi (omp) extension (`mempg.ts`). It gives agents persistent memory backed by Postgres (`pgvector`, the default) or a local SQLite file (`MEMPG_BACKEND=sqlite`), with optional Ollama embeddings.
 - It is published as `@dzhi/mempg`, and only `mempg.ts` ships.
 - `README.md` is the user-facing feature doc. This file covers workflow, patterns and traps.
 
@@ -24,16 +24,22 @@ mempg is a **single-file** oh-my-pi (omp) extension (`mempg.ts`). It gives agent
   - The 7 `memory_*` tools are defined in `TOOL_SPECS`, a host-neutral JSON-schema table and the source of truth.
   - They are converted to zod via `toZod(pi.zod, …)` and registered with `loadMode: "essential"`.
 - **Visibility**:
-  - `visibleRows()` is the single project boundary: `stack_fact`/`episodic` are global, `project_fact` only from its origin project.
+  - `visibleRows()` is the single project boundary: `stack_fact` is global, `project_fact` only from its origin project.
   - Reads (injection, recall, tags) also apply `notSuperseded()`. Only recall and tags accept `global: true` to widen reach; injection never does.
   - Writes (forget, update, retag, the supersede link) are always bounded by `visibleRows()` and have no `global` opt-in. They skip `notSuperseded()`, so superseded rows stay fixable.
+- **Backends**: `SQLITE` (from `MEMPG_BACKEND`) is fixed at load; one `sql` client serves both, Bun's `SQL` with the sqlite adapter or a Postgres pool.
+  - Dialect differences live in small builders in the `// --- Dialect ---` section (`dateCol`, `nowSql`, `tagsParam`, `idIn`, `vectorParam`, `ftsJoin`/`ftsMatch`, `keywordScore`, `nearest`), plus inline `SQLITE ?` branches for retag, tag listing, the recall-record insert and the consolidate meaning pass.
+  - SQLite: tags are JSON text (`tagList()` reads either form), timestamps ISO-8601 UTC text, embeddings float32 blobs ranked in TS, keywords in the external-content `memories_fts` table kept by triggers. `SQLITE_SCHEMA` is its DDL, run by `ready()` on first use.
+  - Every DB entrypoint awaits `ready()` first. Bun's sqlite adapter neither runs an un-awaited query nor orders it before later ones, so schema statements are awaited one by one.
+  - bm25's scale depends on corpus size, so on SQLite `keywordScore` applies the project/cross-session boosts as multipliers, not Postgres' additive constants.
+  - "Newest" orderings end in `id DESC`: SQLite timestamps are millisecond text and tie.
 - **Retrieval**:
   - Keyword FTS is merged with pgvector cosine search via RRF (`hybridMerge`: k=60, top 2 vector rows reserved).
   - Any embed failure degrades silently to keyword-only.
-  - Writes embed fire-and-forget. A NULL embedding means keyword-only until `bun run backfill`.
+  - Writes embed fire-and-forget (`embedInBackground`; `settleEmbeddings()` waits in tests/benches). A NULL embedding means keyword-only until `bun run backfill`. `memory_update` clears the vector in the same UPDATE, and `embedAndStore` only writes while the row still holds the embedded content.
 - **Consolidate** runs two passes:
   1. **Wording**: trigram similarity, computed in TS, with the project boundary enforced by `mutuallyVisibleRows()`.
-  2. **Meaning**: embedding cosine, computed in SQL, with the boundary enforced by `mutuallyVisible()`.
+  2. **Meaning**: embedding cosine, computed in SQL on Postgres (boundary: `mutuallyVisible()`, prefilter: `isTemplatedAutoLogPair`) and in TS on SQLite (`mutuallyVisibleRows()`). Both backends drop templated auto-logs with `isTemplatedContent()`.
   - The meaning pass excludes the wording pass's removals in both real and `dryRun` mode, so a preview matches a real run on the same snapshot.
   - `detailConflicts` routes a pair with a conflicting number, path or proper noun to `[meaning-uncertain]` instead of deleting it.
 - **Cache invalidation is asymmetric**: remember, forget and update clear only the caller's directory. `retag` and a real `consolidate` clear the whole `injectionCache`.
@@ -43,9 +49,10 @@ mempg is a **single-file** oh-my-pi (omp) extension (`mempg.ts`). It gives agent
 | Path | Purpose |
 |---|---|
 | `mempg.ts` | Entire extension, split into `// --- X ---` sections |
-| `tests/mempg.test.ts` | Only test file; integration tests against a live DB |
-| `deploy/` | `compose.yaml` (pgvector + optional ollama), `init/01-init.sh` (**authoritative DDL**), `backfill.ts`, upgrade SQL in `README.md` |
-| `bench/` | Consolidate benchmarks: `embeddinggemma-calibration.ts` (26 pairs, no DB) and `mempg-shaped-consolidate.ts` (808 pairs, scratch DB). Re-run when changing the embed model or `detailConflicts` |
+| `tests/mempg.test.ts` | Postgres integration tests against a live DB (`bun test`) |
+| `tests/sqlite.integration.ts` | SQLite integration tests (`bun run test:sqlite`); named outside `*.test.ts` so plain `bun test` never loads it |
+| `deploy/` | `compose.yaml` (pgvector + optional ollama), `init/01-init.sh` (**authoritative Postgres DDL**), `backfill.ts`, `pg-to-sqlite.ts`, upgrade SQL in `README.md` |
+| `bench/` | `backend-compare.ts` (Postgres vs SQLite, all tools, scratch targets only) and the consolidate benchmarks: `embeddinggemma-calibration.ts` (26 pairs, no DB) and `mempg-shaped-consolidate.ts` (808 pairs, scratch Postgres DB). Re-run the latter two when changing the embed model or `detailConflicts` |
 | `scripts/check-tag-version.sh` | pre-push guard: tag must equal `package.json` version |
 | `.github/workflows/` | `check.yml` (PRs: lint, typecheck, test); `publish.yml` (`v*` tag → npm) |
 
@@ -56,7 +63,9 @@ bun install
 bun run check        # biome lint
 bun run typecheck    # tsc --noEmit
 bun test             # needs live Postgres
-bun run backfill     # embed NULL-embedding rows
+bun run test:sqlite  # SQLite backend, /tmp file, fake in-process embedder
+bun run backfill     # embed NULL-embedding rows (either backend)
+bun run port:sqlite  # copy Postgres memories into an empty SQLite file
 pre-commit install && pre-commit install --hook-type pre-push
 ```
 
@@ -88,7 +97,7 @@ pre-commit install && pre-commit install --hook-type pre-push
 ## Important Files
 
 - `mempg.ts`: the factory `mempg(pi)`, `TOOL_SPECS`, `handleTransform` (injection), `visibleRows`, and `__internals` at the end of the file.
-- `deploy/init/01-init.sh`: the schema. CI bootstraps from this exact file, so drift fails the build.
+- `deploy/init/01-init.sh`: the Postgres schema. CI bootstraps from this exact file, so drift fails the build. SQLite's schema is `SQLITE_SCHEMA` in `mempg.ts`; keep the two in step.
 - `package.json`: `omp.extensions: ["./mempg.ts"]` is the plugin manifest.
 - `README.md`: the tool list and env table. It can lag `TOOL_SPECS`. Update it (and `deploy/README.md` for schema changes) in the same commit.
 
@@ -101,18 +110,20 @@ pre-commit install && pre-commit install --hook-type pre-push
 - **Bun SQL traps**:
   - Arrays need an element type: `sql.array(values, "text")`.
   - Never use `new SQL("postgres://…")` (it emits DEP0169). Use `makeSql()`.
+  - Queries are lazy: a query runs only once awaited or given `.then`/`.catch`, so a bare `void sql\`…\`` never executes. On SQLite, an un-awaited query is not ordered before later ones either.
 - **No `console.*` on the extension path**; it corrupts omp's TUI. `logSink` goes to `pi.logger.error`. CLI scripts may use `console`.
 - **`dispose()` is refcounted**, one retain/release per session. A plain `sql.close()` would kill the pool when a subagent ends.
 - **`before_agent_start` can re-run for one submission.**
   - `firstSighting` is the only exactly-once guard for capture inserts. Keep it.
   - `CAPTURE_NOTE` is appended every time to stop the model storing the request twice.
 - **Config**:
-  - Config is env-only and read once at load: `MEMPG_HOST`, `MEMPG_PORT`, `MEMPG_USER`, `MEMPG_DB`, `MEMPG_PASSWORD`, `MEMPG_SSL`, `MEMPG_INJECTION`, `MEMPG_OLLAMA_HOST`, `MEMPG_OLLAMA_PORT`, `MEMPG_EMBED_MODEL`.
+  - Config is env-only and read once at load: `MEMPG_BACKEND`, `MEMPG_SQLITE_PATH`, `MEMPG_HOST`, `MEMPG_PORT`, `MEMPG_USER`, `MEMPG_DB`, `MEMPG_PASSWORD`, `MEMPG_SSL`, `MEMPG_INJECTION`, `MEMPG_OLLAMA_HOST`, `MEMPG_OLLAMA_PORT`, `MEMPG_EMBED_MODEL`.
   - The embed model defaults to `embeddinggemma:300m` (768-dim).
 
 ## Testing & QA
 
-- **Framework and CI**: `bun:test`, with no coverage tooling. CI runs on PRs against a pgvector container bootstrapped by `deploy/init/01-init.sh`, with no Ollama, so it runs keyword-only.
+- **Framework and CI**: `bun:test`, with no coverage tooling. CI runs on PRs against a pgvector container bootstrapped by `deploy/init/01-init.sh`, with no Ollama, so it runs keyword-only; then `bun run test:sqlite`, which needs neither.
+- **SQLite tests** run in their own process because the backend is fixed at load. The file deletes its database before a dynamic `import("../mempg")` (Bun opens the file when mempg loads) and throws unless `MEMPG_BACKEND=sqlite` with a `/tmp` path. Its fake Ollama is bag-of-words plus synonyms. Wait for embeds with `settleEmbeddings()`; don't orchestrate HTTP timing - awaited SQLite queries do not let pending fetches progress, so polling for an embed write never ends. Test a late embed by calling `embedAndStore` directly.
 - **Hybrid tests** skip unless Ollama is reachable and the `embedding` column exists. A reachable Ollama without the model makes them time out. Pull the model, or set `MEMPG_OLLAMA_PORT=1`.
 - **The last test closes the shared pool.** Never add DB tests after it. `afterAll` cleans `/tmp/mempg-test%` projects with its own client.
 - **Where tests go**: nested describes under `"DB access layer"`. Factory tests go in `"omp extension"`, which uses a fake `ExtensionAPI` and never fires `session_shutdown`.

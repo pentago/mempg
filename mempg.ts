@@ -1,4 +1,5 @@
-// mempg - Postgres-backed persistent memory extension for oh-my-pi (omp).
+// mempg - persistent memory extension for oh-my-pi (omp), on Postgres + pgvector
+// (default) or a local SQLite file (MEMPG_BACKEND=sqlite).
 import { SQL } from "bun";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { ZodLikeSchema } from "@oh-my-pi/omptype/zod";
@@ -64,12 +65,81 @@ function makeSql(cfg: DbConfig): SQL {
   });
 }
 
-const sql = makeSql(defaultConfig);
+// Backend: anything but "sqlite" means Postgres + pgvector. Resolved once at
+// load like the rest of the config. SQLite keeps the same tables in one local
+// file (FTS5 for keywords, float32 blobs for embeddings), so no server is needed.
+const SQLITE = process.env.MEMPG_BACKEND === "sqlite";
+const SQLITE_PATH = process.env.MEMPG_SQLITE_PATH || `${process.env.HOME}/.omp/agent/mempg.sqlite`;
+
+const sql = SQLITE ? new SQL({ adapter: "sqlite", filename: SQLITE_PATH }) : makeSql(defaultConfig);
+
+// SQLite has no bootstrap step like deploy/init/01-init.sh, so the extension
+// creates its schema on first use. The columns mirror 01-init.sh; tags are a
+// JSON array, timestamps ISO-8601 UTC text, embeddings raw float32 bytes.
+// memories_fts is an external-content FTS5 index kept in sync by triggers,
+// standing in for Postgres' generated search_vector column.
+const SQLITE_SCHEMA = [
+  // One connection per process, so these per-connection settings stick.
+  // WAL + busy_timeout let several omp processes share the file.
+  "PRAGMA journal_mode = WAL",
+  "PRAGMA busy_timeout = 5000",
+  // Off by default in SQLite; supersede links and memory_recalls rely on it.
+  "PRAGMA foreign_keys = ON",
+  `CREATE TABLE IF NOT EXISTS memories (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    content          TEXT    NOT NULL,
+    tags             TEXT    NOT NULL DEFAULT '[]' CHECK (json_valid(tags)),
+    session_id       TEXT,
+    project          TEXT,
+    created_at       TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    memory_type      TEXT    NOT NULL DEFAULT 'project_fact',
+    updated_at       TEXT,
+    embedding        BLOB,
+    superseded_by    INTEGER REFERENCES memories(id) ON DELETE SET NULL,
+    CONSTRAINT memories_type_check CHECK (memory_type IN ('stack_fact', 'project_fact'))
+  )`,
+  "CREATE INDEX IF NOT EXISTS idx_memories_project_created ON memories (project, created_at DESC)",
+  `CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
+    USING fts5(content, content='memories', content_rowid='id', tokenize='porter unicode61')`,
+  `CREATE TRIGGER IF NOT EXISTS memories_fts_insert AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts (rowid, content) VALUES (new.id, new.content);
+  END`,
+  `CREATE TRIGGER IF NOT EXISTS memories_fts_delete AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts (memories_fts, rowid, content) VALUES ('delete', old.id, old.content);
+  END`,
+  `CREATE TRIGGER IF NOT EXISTS memories_fts_update AFTER UPDATE OF content ON memories BEGIN
+    INSERT INTO memories_fts (memories_fts, rowid, content) VALUES ('delete', old.id, old.content);
+    INSERT INTO memories_fts (rowid, content) VALUES (new.id, new.content);
+  END`,
+  `CREATE TABLE IF NOT EXISTS memory_recalls (
+    memory_id   INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    session_id  TEXT    NOT NULL,
+    recalled_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (memory_id, session_id)
+  )`,
+];
+
+// Every DB entrypoint awaits this first. Bun opens (and creates) the SQLite
+// file when the client is constructed, but a bad path only fails on the first
+// query, so loading never throws. Statements run one by one: Bun's SQLite
+// adapter neither runs an un-awaited query nor orders it before later ones.
+// A failed init is retried by the next call instead of staying cached.
+let schemaReady: Promise<void> | undefined;
+function ready(): Promise<void> {
+  if (!SQLITE) return Promise.resolve();
+  schemaReady ??= (async () => {
+    for (const statement of SQLITE_SCHEMA) await sql.unsafe(statement);
+  })().catch((e: unknown) => {
+    schemaReady = undefined;
+    throw e;
+  });
+  return schemaReady;
+}
 
 interface MemoryRow {
   id: number;
   content: string;
-  tags: string[] | null;
+  tags: string[] | string | null; // JSON text on SQLite; read through tagList()
   project: string;
   date: string;
 }
@@ -77,6 +147,113 @@ interface MemoryRow {
 // Injected lines render each memory's origin project (memories are global),
 // so the injection queries must select project; id is never rendered.
 type InjectionRow = Pick<MemoryRow, "content" | "tags" | "date" | "project">;
+
+// --- Dialect: the few SQL spots where Postgres and SQLite differ. Pure
+// builders of the backend's client, like the query builders below. ---
+
+// The schema CHECKs tags are valid JSON; anything but an array of strings
+// (a hand-edited row) reads as no tags rather than breaking a render.
+function tagList(tags: string[] | string | null): string[] {
+  if (typeof tags !== "string") return tags ?? [];
+  const parsed: unknown = JSON.parse(tags);
+  return Array.isArray(parsed) ? parsed.filter((t): t is string => typeof t === "string") : [];
+}
+
+function dateCol(client: SQL) {
+  return SQLITE ? client`substr(created_at, 1, 10)` : client`to_char(created_at, 'YYYY-MM-DD')`;
+}
+
+function nowSql(client: SQL) {
+  return SQLITE ? client`strftime('%Y-%m-%dT%H:%M:%fZ', 'now')` : client`now()`;
+}
+
+// A bound tag list. On Postgres, sql.array(tags) alone encodes text[] with
+// quoted elements under bun 1.4.2; the element type hint is required.
+function tagsParam(client: SQL, tags: string[]) {
+  return SQLITE ? JSON.stringify(tags) : client.array(tags, "text");
+}
+
+// `id ${idIn(client, ids)}`: membership in a bound id list.
+function idIn(client: SQL, ids: number[]) {
+  return SQLITE
+    ? client`IN (SELECT value FROM json_each(${JSON.stringify(ids)}))`
+    : client`= ANY(${client.array(ids, "int8")})`;
+}
+
+// A bound embedding: a pgvector literal "[0.1,-0.2,...]" cast to vector, or
+// the raw float32 bytes SQLite stores.
+function vectorParam(client: SQL, vec: number[]) {
+  return SQLITE ? new Uint8Array(new Float32Array(vec).buffer) : client`${JSON.stringify(vec)}::vector`;
+}
+
+// Callers only pass blobs whose byte length matches the vector they compare
+// against; the floor just keeps a malformed blob from throwing.
+function asFloat32(blob: Uint8Array): Float32Array {
+  const length = Math.floor(blob.byteLength / 4);
+  return blob.byteOffset % 4 === 0
+    ? new Float32Array(blob.buffer, blob.byteOffset, length)
+    : new Float32Array(blob.slice(0, length * 4).buffer);
+}
+
+function cosine(a: Float32Array, b: Float32Array): number {
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  return dot / Math.sqrt(na * nb);
+}
+
+// Nearest neighbours by cosine over rows matching `conds` (a fragment of
+// `AND ...` clauses). Postgres orders by pgvector's <=> operator.
+// ponytail: SQLite scans every embedded candidate and ranks in TS, O(n) per
+// query; move to the sqlite-vec extension once that scan shows up in recall
+// latency (bench:backend-compare).
+async function nearest<T>(client: SQL, cols: SQL.Query<unknown>, conds: SQL.Query<unknown>, vec: number[], limit: number): Promise<T[]> {
+  if (!SQLITE) {
+    return (await client`
+      SELECT ${cols} FROM memories
+      WHERE embedding IS NOT NULL ${conds}
+      ORDER BY embedding <=> ${JSON.stringify(vec)}::vector
+      LIMIT ${limit}
+    `) as T[];
+  }
+  // Same-size vectors only, as pgvector's typed column guarantees: a row
+  // embedded by a different model is skipped until the backfill re-embeds it.
+  const rows = (await client`
+    SELECT ${cols}, embedding FROM memories
+    WHERE embedding IS NOT NULL AND length(embedding) = ${vec.length * 4} ${conds}
+  `) as (T & { embedding?: Uint8Array })[];
+  const query = Float32Array.from(vec);
+  return rows
+    .map((row) => ({ row, score: cosine(query, asFloat32(row.embedding as Uint8Array)) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map(({ row }) => {
+      delete row.embedding;
+      return row;
+    });
+}
+
+// Keyword match. Postgres matches the generated search_vector; SQLite joins
+// the FTS5 index, the only place bm25() can be evaluated (negated so higher
+// is better, like ts_rank; keywordScore reads it). Callers add ftsJoin to
+// FROM and ftsMatch to WHERE. An empty query matches nothing, as an empty
+// tsquery does on Postgres (FTS5 rejects a bare '' but not '""').
+function ftsJoin(client: SQL, q: string) {
+  return SQLITE
+    ? client`JOIN (
+        SELECT rowid AS fts_id, -bm25(memories_fts) AS fts_rank FROM memories_fts WHERE memories_fts MATCH ${q || '""'}
+      ) fts ON fts.fts_id = memories.id`
+    : client``;
+}
+
+function ftsMatch(client: SQL, q: string) {
+  return SQLITE ? client`1=1` : client`search_vector @@ to_tsquery('english', ${q})`;
+}
 
 // --- Rate-limited error logging ---
 
@@ -111,25 +288,15 @@ function logError(kind: string, message: string): void {
 
 // --- Query deadline ---
 
-class DeadlineError extends Error {
-  constructor(ms: number) {
-    super(`query exceeded ${ms}ms deadline`);
-    this.name = "DeadlineError";
-  }
-}
-
 // Guards the injection query, which runs in front of every model request: a
 // hung database must degrade to "no memories" rather than stall the turn.
 //
-// This races instead of cancelling. Bun documents query.cancel(), but on bun
-// 1.4.2 it is a no-op for an in-flight Postgres query - verified against
-// SELECT pg_sleep(5), which ran the full 5s under both .execute()+.cancel()
-// and bare .cancel(). So the query is abandoned, not aborted: the caller is
-// freed on time while the connection stays busy until the server finishes.
+// Races instead of cancelling: on bun 1.4.2 query.cancel() is a no-op for an
+// in-flight Postgres query, so the connection stays busy until the server finishes.
 async function withDeadline<T>(query: PromiseLike<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new DeadlineError(ms)), ms);
+    timer = setTimeout(() => reject(Object.assign(new Error(`query exceeded ${ms}ms deadline`), { name: "DeadlineError" })), ms);
   });
   // An abandoned query that later rejects would otherwise surface as an
   // unhandled rejection and take the process down.
@@ -143,22 +310,16 @@ async function withDeadline<T>(query: PromiseLike<T>, ms: number): Promise<T> {
 
 // --- Embeddings (hybrid retrieval: keyword + vector) ---
 
-// embeddinggemma:300m via Ollama over HTTP (host-installed or the compose service,
-// same pattern as the bench). Everything here degrades to keyword-only on any
-// failure; embeddings can never break search. Env-only, resolved once at init
-// like the DB config. The model name is an env var so it is swappable without
-// a code change - a model with different dimensions needs the column re-created
-// and a re-embed (deploy/README.md).
+// embeddinggemma:300m via Ollama over HTTP. Any failure degrades to keyword-only;
+// embeddings can never break search. A model with different dimensions needs the
+// column re-created and a re-embed (deploy/README.md).
 const OLLAMA_HOST = process.env.MEMPG_OLLAMA_HOST || "localhost";
 const OLLAMA_PORT = Number(process.env.MEMPG_OLLAMA_PORT) || 11434;
 const EMBED_MODEL = process.env.MEMPG_EMBED_MODEL || "embeddinggemma:300m";
 let ollamaBase = `http://${OLLAMA_HOST}:${OLLAMA_PORT}`;
 
-// A warm embed was ~20ms (bge-m3, measured 2026-09-18, RTX 5070); a cold model
-// load is ~2-3s, over the injection deadline - so session_start fires a warm-up and
-// every request passes keep_alive to keep the model resident. The query budget
-// only trips when racing that warm-up or a wedged daemon, and both fall back
-// to keyword-only. The write path is fire-and-forget and tolerates cold loads.
+// A cold model load (~2-3s) exceeds the injection deadline, so session_start warms
+// the model and every request passes keep_alive. The write path tolerates cold loads.
 const EMBED_QUERY_TIMEOUT_MS = 750;
 const EMBED_WRITE_TIMEOUT_MS = 15_000;
 // Candidate slice per hybrid half, mirroring the keyword LIMIT 20.
@@ -187,8 +348,7 @@ async function embed(texts: string[], timeoutMs: number): Promise<number[][] | n
 // Reciprocal rank fusion (k=60, the standard constant): a row scores
 // 1/(60 + 1-based rank) in each list it appears in, so a hit in both lists
 // outranks either list's tail. Keyed on content - identical text is the same
-// memory. Bench-verified (2026-09-18 synthetic bench, since removed): recall
-// >= both the keyword and the embedding parent at 485/5k/50k rows.
+// memory.
 function rrfMerge<T extends { content: string }>(lists: T[][], k = 60): T[] {
   const scores = new Map<string, { score: number; row: T }>();
   for (const list of lists) {
@@ -203,16 +363,9 @@ function rrfMerge<T extends { content: string }>(lists: T[][], k = 60): T[] {
   return [...scores.values()].sort((a, b) => b.score - a.score).map((e) => e.row);
 }
 
-// The shipped hybrid composition (slot count benched 2026-09-18): the vector list's top
-// `reserved` rows are UNCONDITIONAL, the rest is the RRF merge minus the
-// picks. Plain RRF alone dilutes vector hits when the keyword half is noisy
-// on the real corpus (equal-weight ties favor keyword-listed rows, and
-// weighting the vector side does not help - rows present in both lists are
-// boosted at any weight). R=2 was the free knee: real paraphrase hit@5
-// 8/20 -> 12/20 with zero measurable synthetic cost (R=3: 13/20 but the first
-// direct-recall regression, and 3/5 of the block can be nearest-neighbor
-// noise on no-signal prompts). reserved=0 or an empty vector list degenerates
-// to the plain merge, so the keyword-only fallbacks need no special case.
+// The vector list's top `reserved` rows are unconditional, the rest is the RRF
+// merge minus those picks: plain RRF dilutes vector hits when the keyword half is
+// noisy, and reweighting doesn't help. reserved=0 or no vector rows = plain merge.
 function hybridMerge<T extends { content: string }>(keywordRows: T[], vectorRows: T[], reserved = 2): T[] {
   const picked = vectorRows.slice(0, reserved);
   const rest = rrfMerge([keywordRows, vectorRows]).filter((r) => !picked.some((p) => p.content === r.content));
@@ -222,25 +375,42 @@ function hybridMerge<T extends { content: string }>(keywordRows: T[], vectorRows
 // Off the write path: embed one memory and store its vector. Never throws -
 // callers fire-and-forget it, so every failure (Ollama down, missing column)
 // lands here. A row whose embedding stays NULL is keyword-only until the
-// backfill (deploy/backfill.ts) or a later memory_update fills it.
+// backfill (deploy/backfill.ts) or a later memory_update fills it. The write
+// only lands while the row still holds `content`: a slow embed of the old text
+// finishing after a memory_update must not overwrite the cleared vector.
 async function embedAndStore(id: number, content: string): Promise<void> {
   const vecs = await embed([content], EMBED_WRITE_TIMEOUT_MS);
   if (!vecs) return;
   try {
-    // pgvector literal "[0.1,-0.2,...]", sent as a text param cast to vector.
-    await sql`UPDATE memories SET embedding = ${JSON.stringify(vecs[0])}::vector WHERE id = ${id}`;
+    await sql`UPDATE memories SET embedding = ${vectorParam(sql, vecs[0])} WHERE id = ${id} AND content = ${content}`;
   } catch (e: unknown) {
     logError("embed-write", `mempg embedding store failed for #${id}: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
+// In-flight write-path embeds, so tests and benches can wait for them before
+// asserting or closing the pool. Session shutdown does not wait: a lost embed
+// only leaves a NULL vector for the backfill, while waiting could hold omp's
+// exit for up to EMBED_WRITE_TIMEOUT_MS.
+const inflightEmbeds = new Set<Promise<void>>();
+
+function track(inflight: Set<Promise<void>>, p: Promise<void>): void {
+  inflight.add(p);
+  void p.finally(() => inflight.delete(p));
+}
+
+function embedInBackground(id: number, content: string): void {
+  track(inflightEmbeds, embedAndStore(id, content));
+}
+
+async function settleEmbeddings(): Promise<void> {
+  await Promise.all(inflightEmbeds);
+}
+
 // --- Injection pipeline ---
 
-// Injection ranking mode (plan follow-up: relevance over blind recency).
-// "relevance" (default) scores all memories - every project - against the
-// user's latest prompt via full-text search, falling back to recency when the
-// prompt matches nothing; "recency" restores the old last-5 behavior via
-// MEMPG_INJECTION=recency. Resolved once at init, env-only.
+// "relevance" (default) ranks visible memories against the latest prompt, falling
+// back to recency on no match; MEMPG_INJECTION=recency injects the latest 5.
 let injectionMode: "relevance" | "recency" =
   process.env.MEMPG_INJECTION === "recency" ? "recency" : "relevance";
 
@@ -256,9 +426,7 @@ function sanitizeMemory(content: string): string {
   return content.replaceAll("</persistent-project-memory>", "");
 }
 
-// Approximates pg_trgm similarity in TS: character-trigram Jaccard. Used only
-// to collapse near-duplicate rows out of the injection candidates (the
-// candidate set is tiny), never for storage decisions.
+// Character-trigram Jaccard, approximating pg_trgm similarity.
 function trigrams(text: string): Set<string> {
   const s = text.toLowerCase().replace(/\s+/g, " ");
   const out = new Set<string>();
@@ -273,10 +441,8 @@ function nearDupeSets(A: Set<string>, B: Set<string>): boolean {
   return inter / (A.size + B.size - inter) >= DEDUP_SIMILARITY;
 }
 
-// Injection fetches a deeper candidate slice (rank-ordered) and greedily drops
-// rows that near-dupe an already-kept row, emitting the top 5. Without this,
-// duplicate writes (there is no write-time rejection) would fill the 5 slots
-// with restatements of one fact.
+// Greedily drops rows that near-dupe a kept row: writes never reject duplicates,
+// so restatements of one fact would otherwise fill all 5 slots.
 function collapseDupes(rows: InjectionRow[]): InjectionRow[] {
   const kept: InjectionRow[] = [];
   for (const row of rows) {
@@ -300,9 +466,7 @@ const WRITE_TRIGGERS: readonly string[] = [
 function formatBlock(rows: InjectionRow[], projectDir: string): string {
   const lines: string[] = [
     "<persistent-project-memory>",
-    // Framing goes BEFORE the rows, not after: it must be read as "this is
-    // what you already know" before the model sees the list, not skimmed as
-    // a footnote once attention has moved on to the rows themselves.
+    // Framing precedes the rows so it isn't skimmed as a footnote.
     "This is your memory of this project across sessions. You have no other",
     "access to it - anything not recorded here or retrievable via memory_recall",
     "did not survive. Treat these as established facts you already know, not",
@@ -312,19 +476,15 @@ function formatBlock(rows: InjectionRow[], projectDir: string): string {
     rows.length === 0 ? "Memories: none visible here yet." : "Memories:",
   ];
   for (const row of rows) {
-    const tags = row.tags ?? [];
+    const tags = tagList(row.tags);
     const tagStr = tags.length ? ` [${tags.join(", ")}]` : "";
-    // Origin project matters now that memories are shared: basename keeps the
-    // injected line short.
+    // Memories are shared, so show the origin project (basename keeps it short).
     const origin = row.project.split('/').pop() ?? row.project;
     lines.push(`- [${row.date}] (${origin})${tagStr} ${sanitizeMemory(truncateMemory(row.content))}`);
   }
   lines.push("");
-  // Concrete, observable triggers replace "non-trivial work": a threshold the
-  // model evaluates in its own favor always resolves toward skipping, so each
-  // bullet names an event instead of asking for a judgment call. The "lost
-  // permanently" framing states the cost of skipping, which the old trailing
-  // line never did.
+  // Each bullet names an observable event: a threshold the model judges itself
+  // always resolves toward skipping.
   lines.push(
     "Write to memory when any of these happen - do not defer, the session ends without warning and unwritten context is lost permanently:",
   );
@@ -339,67 +499,44 @@ function formatBlock(rows: InjectionRow[], projectDir: string): string {
   return lines.join("\n");
 }
 
-// Keyed by directory + prompt hash now that the block depends on the prompt
-// (relevance mode): an identical prompt (model retries, re-requests) hits the
-// cache; a new prompt queries afresh. A zero-row result caches the
-// guidance-only block, so no-match prompts stop re-querying.
+// Keyed by directory + prompt hash so retries hit the cache. Zero-row results are
+// cached too, so no-match prompts stop re-querying.
 const injectionCache = new Map<string, string>();
 
-// The user's prompt is the retrieval signal; capped because a query is a
-// query, not a transcript - FTS is not helped by thousands of characters.
+// Retrieval query cap: FTS gains nothing from thousands of characters.
 function capPromptQuery(text: string): string {
   return text.trim().slice(0, 512);
 }
 
-// Visibility rule shared by recall and both injection builders: the global
-// type (stack_fact) is visible everywhere; project_fact is visible only from
-// its origin project unless explicitly opted out with global: true (recall)
-// - at injection time there is no caller to opt in, so other projects'
-// project_fact rows never surface as ambient context.
+// stack_fact is visible everywhere; project_fact only from its origin project,
+// unless recall passes global: true (injection never does).
 function visibleRows(client: SQL, directory: string) {
   return client`(memory_type != 'project_fact' OR project = ${directory})`;
 }
 
-// A superseded memory (supersede-tracking: memory_remember's `supersedes`
-// argument) is history, not current fact - it must never surface as ambient
-// context or in a normal recall. Layered ON TOP of visibleRows rather than
-// merged into it: forget and memory_update must still be able to reach a
-// superseded row (delete it outright, or fix a bad supersede link), so the
-// ownership check they run stays separate from the "is this current"
-// check recall/injection run.
+// Superseded rows are history, hidden from injection and normal recall. Kept
+// separate from visibleRows because forget/update must still reach them.
 function notSuperseded(client: SQL) {
   return client`superseded_by IS NULL`;
 }
 
-// Recency query shared by the recency mode and the no-match fallback: latest
-// visible rows, newest first. Global by design - the project column records
-// origin, not visibility, for global types; project_fact is origin-scoped
-// (see visibleRows).
-// Query builders are pure functions of the client, so they run unchanged
-// against any database, not just the module pool.
+// Latest visible rows. "Newest" orderings end in `id DESC` everywhere: SQLite
+// timestamps are millisecond text, so back-to-back writes can tie.
 function buildRecencyQuery(client: SQL, directory: string) {
   // LIMIT 20: a candidate slice for collapseDupes, not the final block.
   return client`
     SELECT content, coalesce(tags, '{}') AS tags,
-           to_char(created_at, 'YYYY-MM-DD') AS date,
+           ${dateCol(client)} AS date,
            project
     FROM memories
     WHERE ${visibleRows(client, directory)} AND ${notSuperseded(client)}
-    ORDER BY created_at DESC
+    ORDER BY created_at DESC, id DESC
     LIMIT 20
   `;
 }
 
-// Cross-session recall tiebreak (spec: cross-session-recall-signal.md):
-// COUNT(DISTINCT session_id) from memory_recalls, capped and weighted well
-// below the same-project boost (0.01) so it only breaks near-ties, never
-// overrides relevance. Deliberately NOT access_count - that column is bumped
-// on every recall regardless of session, which is exactly the rich-get-richer
-// signal a prior attempt reverted (see recall()'s comment). The PRIMARY KEY on
-// (memory_id, session_id) in memory_recalls makes repeated recalls from ONE
-// session count once, so this only grows from genuinely separate sessions
-// reaching for the same memory - slow to accumulate by design, which is what
-// makes it safe to rank on.
+// Cross-session tiebreak: distinct sessions that recalled the memory, capped and
+// weighted below the same-project boost. Repeat recalls in one session count once.
 function crossSessionJoin(client: SQL) {
   return client`
     LEFT JOIN (
@@ -410,64 +547,78 @@ function crossSessionJoin(client: SQL) {
   `;
 }
 
-function crossSessionBoost(client: SQL) {
-  return client`LEAST(coalesce(recalls.xsess, 0), 5) * 0.002`;
+// The keyword ranking: text rank plus the same-project boost (injection only,
+// `directory` null skips it) and the cross-session tiebreak. On Postgres both
+// are small constants beside ts_rank, whose scale is fixed (~0.06 per matched
+// term). bm25's scale depends on corpus size (~1e-6 on a handful of rows), so
+// on SQLite constants would swamp it; the same boosts become multipliers
+// instead, sized to the share of a one-term ts_rank they amount to on
+// Postgres (0.01 ~ 15%, 0.002 ~ 3%).
+function keywordScore(client: SQL, tsQuery: string, directory: string | null) {
+  if (SQLITE) {
+    const project = directory === null ? client`0` : client`(CASE WHEN project = ${directory} THEN 0.15 ELSE 0 END)`;
+    return client`fts.fts_rank * (1 + ${project} + min(coalesce(recalls.xsess, 0), 5) * 0.03)`;
+  }
+  const project = directory === null ? client`0` : client`(CASE WHEN project = ${directory} THEN 0.01 ELSE 0 END)`;
+  return client`ts_rank(search_vector, to_tsquery('english', ${tsQuery})) + ${project} + LEAST(coalesce(recalls.xsess, 0), 5) * 0.002`;
 }
 
 function buildRelevanceQuery(client: SQL, tsQuery: string, directory: string) {
-  // Relevance: full-text search over every visible memory - global types
-  // from anywhere, project_fact from the origin project - with a small
-  // same-project boost to break rank ties toward locally stored memories,
-  // plus the smaller cross-session tiebreak above.
   return client`
     SELECT content, coalesce(tags, '{}') AS tags,
-           to_char(created_at, 'YYYY-MM-DD') AS date,
+           ${dateCol(client)} AS date,
            project
     FROM memories
     ${crossSessionJoin(client)}
-    WHERE search_vector @@ to_tsquery('english', ${tsQuery})
+    ${ftsJoin(client, tsQuery)}
+    WHERE ${ftsMatch(client, tsQuery)}
       AND ${visibleRows(client, directory)}
       AND ${notSuperseded(client)}
-    ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsQuery}))
-             + (CASE WHEN project = ${directory} THEN 0.01 ELSE 0 END)
-             + ${crossSessionBoost(client)} DESC,
-             created_at DESC
+    ORDER BY ${keywordScore(client, tsQuery, directory)} DESC,
+             created_at DESC, id DESC
     LIMIT 20
   `;
 }
 
-// Vector half of the hybrid: nearest neighbors by cosine distance over the
-// same visibility rules as the keyword half. Unlike FTS this always returns
-// rows when embedded rows exist (nearest is always *something*), so the
-// caller merges it via rrfMerge - and the recency fallback stays for the
-// "no retrieval signal at all" case. Fails on a database without the
-// embedding column; the caller catches and runs keyword-only.
-function buildVectorQuery(client: SQL, vectorLit: string, directory: string) {
-  return client`
-    SELECT content, coalesce(tags, '{}') AS tags,
-           to_char(created_at, 'YYYY-MM-DD') AS date,
-           project
-    FROM memories
-    WHERE embedding IS NOT NULL
-      AND ${visibleRows(client, directory)}
-      AND ${notSuperseded(client)}
-    ORDER BY embedding <=> ${vectorLit}::vector
-    LIMIT ${EMBED_CANDIDATES}
-  `;
+// Vector half of the hybrid. Always returns rows when any are embedded, so the
+// caller merges via rrfMerge. Throws without an embedding column; caller falls back.
+function buildVectorQuery(client: SQL, vec: number[], directory: string) {
+  return nearest<InjectionRow>(
+    client,
+    client`content, coalesce(tags, '{}') AS tags, ${dateCol(client)} AS date, project`,
+    client`AND ${visibleRows(client, directory)} AND ${notSuperseded(client)}`,
+    vec,
+    EMBED_CANDIDATES,
+  );
 }
 
 // The prompt as an OR of stemmed words: websearch_to_tsquery ANDs the terms,
-// so one word the memory never uses would zero out the whole query (bench:
-// recall 0.00-0.02 on multi-word queries). OR ranks by how many (and how
+// so one word the memory never uses would zero out the whole query. OR ranks by how many (and how
 // rare) the matched terms are, and sanitizing to [a-z0-9]+ tokens keeps
 // to_tsquery syntax-safe. Capped at 24 words to bound the query.
+// SQLite's FTS5 has no stopword list, so the words Postgres' english config
+// drops are removed here instead; a prompt of only stopwords becomes `""`,
+// which, like Postgres' empty tsquery, matches nothing.
 function orTsQuery(text: string): string {
-  const words = text.toLowerCase().match(/[a-z0-9]+/g) ?? [];
-  return words.slice(0, 24).join(" | ");
+  const words = (text.toLowerCase().match(/[a-z0-9]+/g) ?? []).slice(0, 24);
+  if (!SQLITE) return words.join(" | ");
+  const terms = words.filter((w) => !STOPWORDS.has(w));
+  if (terms.length === 0) return words.length ? '""' : "";
+  return terms.map((w) => `"${w}"`).join(" OR ");
 }
 
-// The block depends on the directory plus (in relevance mode) the prompt,
-// passed explicitly by the caller.
+// Postgres' english.stop, verbatim (tsearch_data/english.stop, pg 18).
+const STOPWORDS = new Set(
+  (
+    "i me my myself we our ours ourselves you your yours yourself yourselves he him his himself she her hers " +
+    "herself it its itself they them their theirs themselves what which who whom this that these those am is " +
+    "are was were be been being have has had having do does did doing a an the and but if or because as until " +
+    "while of at by for with about against between into through during before after above below to from up " +
+    "down in out on off over under again further then once here there when where why how all any both each few " +
+    "more most other some such no nor not only own same so than too very s t can will just don should now"
+  ).split(" "),
+);
+
 async function handleTransform(
   output: { system: string[] },
   directory: string,
@@ -482,32 +633,28 @@ async function handleTransform(
     return;
   }
   try {
+    await withDeadline(ready(), 1000);
     const inject = (q: unknown) => withDeadline(q as PromiseLike<InjectionRow[]>, 1000);
     let rows: InjectionRow[] = [];
     const tsQuery = orTsQuery(query);
     if (tsQuery) {
-      // Hybrid: the keyword half always runs; the embedding half is started
-      // concurrently so a warm embed (~20ms) hides behind the keyword
-      // round-trip. Null embedding (Ollama down/timeout) or a failed vector
-      // query (pre-migration database, DeadlineError) degrade to keyword-only.
+      // Embed concurrently so it hides behind the keyword round-trip; any
+      // embed or vector-query failure degrades to keyword-only.
       const embedding = embed([query], EMBED_QUERY_TIMEOUT_MS);
       const keywordRows = await inject(buildRelevanceQuery(sql, tsQuery, directory));
       rows = keywordRows;
       const vecs = await embedding;
       if (vecs) {
-        const vectorRows = await inject(buildVectorQuery(sql, JSON.stringify(vecs[0]), directory)).catch((e: unknown) => {
+        const vectorRows = await inject(buildVectorQuery(sql, vecs[0], directory)).catch((e: unknown) => {
           logError("embed-query", `mempg vector query failed, keyword-only: ${e instanceof Error ? e.message : String(e)}`);
           return null;
         });
         if (vectorRows) rows = hybridMerge(keywordRows, vectorRows);
       }
     }
-    // No retrieval signal at all (no prompt, or nothing matched) - recency
-    // beats an empty block. The vector half alone counts as a signal: a
-    // zero-overlap paraphrase is exactly what embeddings are for.
+    // No signal at all: recency beats an empty block. Vector hits alone count.
     if (rows.length === 0) rows = await inject(buildRecencyQuery(sql, directory));
     const block = formatBlock(collapseDupes(rows), directory);
-    // Evict oldest entry when cache exceeds 32
     if (injectionCache.size >= 32) {
       const firstKey = injectionCache.keys().next().value;
       if (firstKey !== undefined) injectionCache.delete(firstKey);
@@ -539,22 +686,15 @@ async function dispose(): Promise<void> {
 
 // --- Agent tools: recall + remember with dedup-on-write ---
 
-// Write caps: these are abuse guards, not style rules. Measured against a real
-// 485-memory corpus (p95 content 517 chars, p95 5 tags, longest tag 26 chars),
-// so ordinary memories never come close.
+// Write caps are abuse guards, far above ordinary memories.
 const MAX_CONTENT = 4000;
 const MIN_CONTENT = 10;
 const MAX_TAGS = 10;
 const MAX_TAG_LENGTH = 64;
 
-// Soft nudge only - never a rejection. Sits just above the injection block's
-// 600-char truncation point (formatBlock): past this length, injection would
-// cut the entry off anyway, so write time is the natural place to say so.
+// Soft nudge, never a rejection: just above formatBlock's 600-char injection cut.
 const CONTENT_LENGTH_NUDGE = 700;
 
-// A write past this length still succeeds; the response just says so, so the
-// calling agent can shorten future entries instead of finding out later that
-// most of a long memory never made it into ambient context.
 function lengthNudge(content: string): string {
   if (content.length <= CONTENT_LENGTH_NUDGE) return "";
   return (
@@ -564,16 +704,11 @@ function lengthNudge(content: string): string {
   );
 }
 
-// --- Memory types (plan 2.1: defaulted, never required) ---
+// --- Memory types ---
 
-// The stored vocabulary mirrors the DB CHECK constraint (memories_type_check);
-// rows predate the column, so "required" would break every existing caller -
-// type is always defaulted. Visibility follows the type: stack_fact is
-// global (tooling knowledge ports across every project using the stack),
-// project_fact is origin-project-only (customer-specific facts must not
-// surface elsewhere), episodic is reserved for the (cut, opt-in) 1.3 feature;
-// remember accepts it so the vocabulary stays in one place.
-const MEMORY_TYPES = ["stack_fact", "project_fact", "episodic"] as const;
+// Mirrors memories_type_check. project_fact is origin-project-only so
+// customer-specific facts never surface elsewhere.
+const MEMORY_TYPES = ["stack_fact", "project_fact"] as const;
 type MemoryType = (typeof MEMORY_TYPES)[number];
 
 // Raw JSON Schema input is not coerced for us: a model sending "3" or null for
@@ -589,12 +724,6 @@ function clampInt(raw: unknown, fallback: number, max: number): number {
 // not end up in a transcript sent to the provider.
 function toolError(kind: string, action: string, e: unknown): string {
   logError(kind, `mempg ${action} failed: ${e instanceof Error ? e.message : String(e)}`);
-  // 42883 = undefined_function. The only way to hit it here is a database
-  // without pg_trgm, which is worth naming: the fix is one statement and the
-  // generic message would send the operator hunting.
-  if (String((e as { errno?: unknown })?.errno) === "42883") {
-    return "ERROR: this database is missing the pg_trgm extension, which memory_remember needs for duplicate detection. Run: CREATE EXTENSION pg_trgm;";
-  }
   return `ERROR: memory store unavailable (${action} failed; see the omp log under ~/.omp/logs).`;
 }
 
@@ -603,68 +732,56 @@ async function recall(
   ctx: { directory: string; sessionID?: string },
 ): Promise<string> {
   try {
+    await ready();
     const limit = clampInt(args.limit, 10, 20);
-    // Visibility: the global type (stack_fact) everywhere; project_fact only
-    // from the origin project unless the caller opts in with global: true.
     const visibleCond = args.global ? sql`` : sql`AND ${visibleRows(sql, ctx.directory)}`;
-    // Superseded memories are hidden by default (same posture as injection);
-    // includeSuperseded surfaces them for history/audit, annotated below.
     const supersededCond = args.includeSuperseded ? sql`` : sql`AND ${notSuperseded(sql)}`;
     const q = args.query ?? "";
     const tsQuery = q ? orTsQuery(q) : "";
-    const queryCond = q
-      ? sql`AND search_vector @@ to_tsquery('english', ${tsQuery})`
-      : sql``;
-    // Tags are not part of search_vector (it covers content only), so they are
-    // unreachable by query alone. Matches rows carrying ALL the given tags,
-    // served by idx_memories_tags.
-    const tagList = Array.isArray(args.tags) ? args.tags.filter((t) => typeof t === "string" && t) : [];
-    const tagCond = tagList.length
-      ? sql`AND tags @> ${sql.array(tagList, "text")}`
-      : sql``;
-    // Relevance-ranked when searching; undirected browse is plain recency
-    // (matching the injection fallback). A frequency blend was tried and
-    // removed: bumping exactly the returned top-5 is a rich-get-richer loop -
-    // live corpus rows pinned the top slot after a few runs. access_count
-    // stays as data collection; no ranking consumes it. The cross-session
-    // tiebreak is different in kind (see crossSessionBoost's comment): it
-    // only grows from distinct sessions independently reaching for a memory,
-    // not from raw exposure, which is what makes it safe to rank on.
+    const queryCond = q ? sql`AND ${ftsMatch(sql, tsQuery)}` : sql``;
+    // Tags aren't in search_vector, so this filter is the only way to reach them.
+    const wantTags = Array.isArray(args.tags) ? args.tags.filter((t) => typeof t === "string" && t) : [];
+    const tagCond = !wantTags.length
+      ? sql``
+      : SQLITE
+        ? sql`AND NOT EXISTS (
+            SELECT 1 FROM json_each(${JSON.stringify(wantTags)}) want
+            WHERE want.value NOT IN (SELECT value FROM json_each(memories.tags))
+          )`
+        : sql`AND tags @> ${sql.array(wantTags, "text")}`;
+    // No raw exposure count feeds ranking: bumping the returned rows would be a
+    // rich-get-richer loop.
     const orderBy = q
-      ? sql`ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsQuery})) + ${crossSessionBoost(sql)} DESC`
-      : sql`ORDER BY created_at DESC`;
+      ? sql`ORDER BY ${keywordScore(sql, tsQuery, null)} DESC, created_at DESC, id DESC`
+      : sql`ORDER BY created_at DESC, id DESC`;
 
-    // Hybrid: with a searchable query, embed it concurrently so a warm embed
-    // (~20ms) hides behind the keyword round-trip; the vector half then merges
-    // via RRF. Any embedding failure (Ollama down, no embedding column yet)
-    // degrades to exactly the pre-hybrid keyword-only behavior.
+    // Embed concurrently; any embedding failure degrades to keyword-only.
     const embedding = tsQuery ? embed([q], EMBED_QUERY_TIMEOUT_MS) : Promise.resolve(null);
     // A directed query fetches a candidate slice for the RRF merge; the
     // caller's limit is applied after. Browse keeps its plain LIMIT.
+    type RecallRow = MemoryRow & { memory_type: string; superseded_by: number | null };
+    const cols = sql`id, content, coalesce(tags, '{}') AS tags, ${dateCol(sql)} AS date, project, memory_type, superseded_by`;
     const keywordRows = await sql`
-      SELECT id, content, coalesce(tags, '{}') AS tags,
-             to_char(created_at, 'YYYY-MM-DD') AS date,
-             project, memory_type, superseded_by
+      SELECT ${cols}
       FROM memories
       ${crossSessionJoin(sql)}
+      ${q ? ftsJoin(sql, tsQuery) : sql``}
       WHERE 1=1 ${visibleCond} ${supersededCond} ${queryCond} ${tagCond}
       ${orderBy}
       LIMIT ${q ? EMBED_CANDIDATES : limit}
-    ` as (MemoryRow & { memory_type: string; superseded_by: number | null })[];
+    ` as RecallRow[];
 
     let rows = keywordRows;
     const vecs = await embedding;
     if (vecs) {
       // Same filters as the keyword half, minus the FTS condition.
-      const vectorRows = await (sql`
-        SELECT id, content, coalesce(tags, '{}') AS tags,
-               to_char(created_at, 'YYYY-MM-DD') AS date,
-               project, memory_type, superseded_by
-        FROM memories
-        WHERE embedding IS NOT NULL ${visibleCond} ${supersededCond} ${tagCond}
-        ORDER BY embedding <=> ${JSON.stringify(vecs[0])}::vector
-        LIMIT ${EMBED_CANDIDATES}
-      ` as unknown as Promise<(MemoryRow & { memory_type: string; superseded_by: number | null })[]>).catch((e: unknown) => {
+      const vectorRows = await nearest<RecallRow>(
+        sql,
+        cols,
+        sql`${visibleCond} ${supersededCond} ${tagCond}`,
+        vecs[0],
+        EMBED_CANDIDATES,
+      ).catch((e: unknown) => {
         logError("embed-query", `mempg vector query failed, keyword-only: ${e instanceof Error ? e.message : String(e)}`);
         return null;
       });
@@ -677,40 +794,32 @@ async function recall(
     }
     if (q) rows = rows.slice(0, limit);
 
-    // Access ranking is recall-only (plan 2.2): the injection path stays
-    // read-only because its per-directory cache would make increments biased.
-    // Fire-and-forget so the UPDATE never sits on the read path's latency.
     const ids = rows.map((r) => r.id);
-    if (ids.length > 0) {
-      void sql`UPDATE memories SET access_count = access_count + 1, last_accessed_at = now() WHERE id = ANY(${sql.array(ids, "int8")})`.catch(
-        (e: unknown) => logError("access", `mempg access bump failed: ${e instanceof Error ? e.message : String(e)}`),
-      );
-    }
-    // Cross-session recall signal: records which session reached for each
-    // returned memory. The PRIMARY KEY on (memory_id, session_id) makes this
-    // naturally idempotent - repeated recalls within one session count once,
-    // so only genuinely distinct sessions grow crossSessionBoost's count.
-    // Skipped without a sessionID (only __internals callers omit it); never
-    // allowed to block or fail the recall itself.
+    // Records the cross-session signal (idempotent per session via the PK);
+    // must never block or fail the recall.
     if (ids.length > 0 && ctx.sessionID) {
-      void sql`
-        INSERT INTO memory_recalls (memory_id, session_id)
-        SELECT unnest(${sql.array(ids, "int8")}), ${ctx.sessionID}
-        ON CONFLICT (memory_id, session_id) DO NOTHING
-      `.catch((e: unknown) => logError("xsess", `mempg cross-session record failed: ${e instanceof Error ? e.message : String(e)}`));
+      const record = SQLITE
+        ? sql`
+            INSERT OR IGNORE INTO memory_recalls (memory_id, session_id)
+            SELECT value, ${ctx.sessionID} FROM json_each(${JSON.stringify(ids)})
+          `
+        : sql`
+            INSERT INTO memory_recalls (memory_id, session_id)
+            SELECT unnest(${sql.array(ids, "int8")}), ${ctx.sessionID}
+            ON CONFLICT (memory_id, session_id) DO NOTHING
+          `;
+      void record.catch((e: unknown) => logError("xsess", `mempg cross-session record failed: ${e instanceof Error ? e.message : String(e)}`));
     }
 
     if (rows.length === 0) return "No memories found.";
 
     return rows
       .map((r) => {
-        const tags = r.tags ?? [];
+        const tags = tagList(r.tags);
         const tagStr = tags.length ? ` (${tags.join(', ')})` : '';
-        // episodic is worth surfacing; project_fact is the default every
-        // pre-column row carries, so printing it is pure noise.
+        // project_fact is the default every pre-column row carries, so
+        // printing it is pure noise.
         const typeStr = r.memory_type === "project_fact" ? "" : ` [${r.memory_type}]`;
-        // Only ever set when includeSuperseded surfaced this row - a normal
-        // recall never returns a superseded row to annotate in the first place.
         const supersededStr = r.superseded_by ? ` [superseded by #${r.superseded_by}]` : '';
         return `[${r.date}] [${r.project}]${typeStr}${tagStr}\n#${r.id}${supersededStr}\n${r.content}`;
       })
@@ -720,29 +829,25 @@ async function recall(
   }
 }
 
-// Lists distinct tags in use, with counts, so a caller can reuse an
-// established tag instead of minting a near-duplicate (e.g. "postgres" vs
-// "tool:postgres"). Same visibility rule as every other read path; superseded
-// rows' tags are excluded (history, not active vocabulary). unnest over the
-// existing tags[] needs no new index at this corpus size - the GIN index on
-// tags is for the `@>` containment filter recall uses, not this aggregate.
-// `client` defaults to the module pool, same as visibleRows/notSuperseded -
-// a test can pass a dedicated connection pointed at an isolated schema to
-// exercise a genuinely empty table without touching real data.
+// Tag counts so callers reuse established tags; superseded rows' tags excluded.
 async function listTags(args: TagsArgs, ctx: { directory: string }, client: SQL = sql): Promise<string> {
   try {
-    // Distinct tags are cheap per row, so the default is high: 50 starved rare
-    // one-off tags out of a ~50-tag corpus - the tags this tool exists to surface.
+    await ready();
+    // High default: rare one-off tags are what this tool exists to surface.
     const limit = clampInt(args.limit, 200, 500);
     const visibleCond = args.global ? client`` : client`AND ${visibleRows(client, ctx.directory)}`;
+    // SQLite unnests the JSON array with json_each; the output alias `tag`
+    // then serves GROUP BY/ORDER BY on both backends.
+    const tagCol = SQLITE ? client`t.value AS tag` : client`tag`;
+    const tagSource = SQLITE ? client`json_each(memories.tags) AS t` : client`unnest(tags) AS tag`;
     const rows = await client`
-      SELECT tag, count(*) AS uses
-      FROM memories, unnest(tags) AS tag
+      SELECT ${tagCol}, count(*) AS uses
+      FROM memories, ${tagSource}
       WHERE 1=1 ${visibleCond} AND ${notSuperseded(client)}
       GROUP BY tag
       ORDER BY uses DESC, tag ASC
       LIMIT ${limit}
-    ` as { tag: string; uses: string }[];
+    ` as { tag: string; uses: string | number }[];
 
     if (rows.length === 0) return "No tags found.";
     return rows.map((r) => `${r.tag} (${r.uses})`).join("\n");
@@ -751,9 +856,7 @@ async function listTags(args: TagsArgs, ctx: { directory: string }, client: SQL 
   }
 }
 
-// Only the length cap is worth enforcing here (mirrors validateWrite's tag
-// check, same error shape) - a rename target that would itself be an invalid
-// tag to write shouldn't be allowed to land via a different path.
+// A rename must not land a tag validateWrite would reject.
 function validateRetag(args: RetagArgs): string | null {
   if (typeof args.old !== "string" || args.old.length === 0) {
     return "ERROR: old must be a non-empty tag string.";
@@ -767,32 +870,41 @@ function validateRetag(args: RetagArgs): string | null {
   return null;
 }
 
-// Renames a tag across every row the caller can currently reach - same
-// project-boundary guard as forget/update (visibleRows()), not memory_tags'
-// global search flag: a write's reach is inherent to which rows the WHERE
-// clause can touch, not something to opt into widening. array_replace()
-// alone does NOT deduplicate: a row already tagged both `old` and `new`
-// would end up with `new` twice (verified directly against Postgres, not
-// assumed) - the DISTINCT/unnest wrap is required, not optional polish.
+// Same project-boundary guard as forget/update. array_replace() doesn't dedupe:
+// a row tagged both `old` and `new` would get `new` twice, hence DISTINCT/unnest.
 async function retag(args: RetagArgs, ctx: { directory: string }): Promise<string> {
   try {
     const invalid = validateRetag(args);
     if (invalid) return invalid;
+    await ready();
 
-    const updated = await sql`
-      UPDATE memories
-      SET tags = ARRAY(SELECT DISTINCT unnest(array_replace(tags, ${args.old}, ${args.new})))
-      WHERE tags @> ARRAY[${args.old}]
-        AND ${visibleRows(sql, ctx.directory)}
-      RETURNING id
-    ` as { id: number }[];
+    // SQLite rebuilds the JSON array in its original order, dropping the
+    // duplicate the rename can create (GROUP BY keeps each tag's first slot).
+    const updated = await (SQLITE
+      ? sql`
+          UPDATE memories
+          SET tags = (
+            SELECT json_group_array(tag) FROM (
+              SELECT CASE WHEN value = ${args.old} THEN ${args.new} ELSE value END AS tag, min(key) AS pos
+              FROM json_each(memories.tags) GROUP BY tag ORDER BY pos
+            )
+          )
+          WHERE EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE value = ${args.old})
+            AND ${visibleRows(sql, ctx.directory)}
+          RETURNING id
+        `
+      : sql`
+          UPDATE memories
+          SET tags = ARRAY(SELECT DISTINCT unnest(array_replace(tags, ${args.old}, ${args.new})))
+          WHERE tags @> ARRAY[${args.old}]
+            AND ${visibleRows(sql, ctx.directory)}
+          RETURNING id
+        `) as { id: number }[];
 
     if (updated.length === 0) {
       return `No memories tagged "${args.old}".`;
     }
-    // A rename can touch stack_fact/episodic rows visible from every
-    // project's injected block, so a per-directory invalidateInjection()
-    // isn't enough - same reasoning as memory_consolidate's real-removal clear.
+    // stack_fact rows show in every project's block: clear all, not one directory.
     injectionCache.clear();
     return `Retagged ${updated.length} ${updated.length === 1 ? "memory" : "memories"}: "${args.old}" → "${args.new}".`;
   } catch (e: unknown) {
@@ -825,19 +937,12 @@ function validateWrite(args: RememberArgs): string | null {
   return null;
 }
 
-// Trigram similarity threshold for near-duplicate handling (consolidation and
-// the injection collapse pass). Measured on a real 485-memory corpus: 0.8 is
-// strict enough that only restatements collide. Writes never reject on it -
-// duplicates are cleaned up by memory_consolidate and collapsed out of the
-// injected block.
+// Trigram threshold for consolidation and injection collapse: at 0.8 only
+// restatements collide.
 const DEDUP_SIMILARITY = 0.8;
 
-// Thrown (and caught) only for the `supersedes` boundary/existence checks
-// inside remember()'s transaction - distinct from a generic DB failure so the
-// catch block can return the specific message instead of toolError's generic
-// one, and so the thrown error rolls back the insert too (supersede failing
-// must not silently leave the new memory stored with no link, nor leave it
-// stored at all - same "fail loud, not a silent no-op" posture as forget/update).
+// Supersede check failure: rolls back the insert and returns a specific message
+// instead of toolError's generic one.
 class SupersedeError extends Error {}
 
 async function remember(
@@ -847,6 +952,7 @@ async function remember(
   try {
     const invalid = validateWrite(args);
     if (invalid) return invalid;
+    await ready();
 
     let supersedesId: number | undefined;
     if (args.supersedes !== undefined) {
@@ -861,15 +967,11 @@ async function remember(
     const tags = args.tags ?? [];
     const basename = ctx.directory.split('/').pop() ?? ctx.directory;
 
-    // Atomic: insert the new memory and (optionally) link the old one in one
-    // transaction. If the supersede target is unreachable (wrong project, or
-    // gone), the whole thing rolls back - no orphaned insert.
+    // One transaction: an unreachable supersede target rolls back the insert.
     const newId = await sql.begin(async (tx) => {
-      // sql.array(tags) alone encodes text[] with quoted elements under bun 1.4.2;
-      // the element type hint is required for clean array storage.
       const [{ id }] = await tx`
         INSERT INTO memories (content, tags, session_id, project, memory_type)
-        VALUES (${args.content}, ${tx.array(tags, "text")}, ${ctx.sessionID}, ${ctx.directory}, ${args.type ?? "project_fact"})
+        VALUES (${args.content}, ${tagsParam(tx, tags)}, ${ctx.sessionID}, ${ctx.directory}, ${args.type ?? "project_fact"})
         RETURNING id
       ` as { id: number }[];
       if (supersedesId === undefined) return id;
@@ -893,12 +995,9 @@ async function remember(
 
     // Fire-and-forget: a failure leaves embedding NULL, keyword search keeps
     // working, and the backfill (deploy/backfill.ts) fills the gap later.
-    void embedAndStore(newId, args.content);
+    embedInBackground(newId, args.content);
 
-    // The injection block is global, but its cache is keyed by the calling
-    // directory + prompt; clear the directory's keys. A supersede changes
-    // what's current for every project too (the old row stops surfacing),
-    // same as any other write.
+    // Cache is keyed by directory + prompt; clear this directory's keys.
     invalidateInjection(ctx.directory);
     return `Stored memory #${newId} (project ${basename}).${lengthNudge(args.content)}`;
   } catch (e: unknown) {
@@ -907,16 +1006,13 @@ async function remember(
   }
 }
 
-// --- Keyword capture (plan 1.1, revised) ---
+// --- Keyword capture ---
 
 // Deterministic capture, no LLM: a trigger phrase in the prompt stores the
 // first paragraph after it verbatim (minus the trigger, subject to the code
 // and length guards below) through the normal write path.
-// Extracting "relevant content" instead would be a model judgment on the
-// prompt-admission path - nondeterministic, and it violates the project rule
-// that model judgment never becomes load-bearing (memory #1555).
-// Global flag so extractMemoryRequest can walk every candidate via matchAll
-// (which clones the regex - no lastIndex state leaks between calls).
+// Model extraction would make judgment load-bearing on prompt admission.
+// Global flag for matchAll (which clones the regex, so no lastIndex leaks).
 const MEMORY_TRIGGER_RE =
   /\b(?:remember(?:\s+(?:this|that|to))?|do(?:n'?| no)t forget(?:\s+(?:this|that|to))?|keep (?:this|that )?in mind(?: that)?)\b\s*[:,]?\s*/gi;
 
@@ -926,9 +1022,8 @@ const MEMORY_TRIGGER_RE =
 // "when" alone is not enough - only skip the bare question forms.
 const INTERROGATIVE_RE = /^(?:when|what|where|why|how|who|whom|whose|which|did)\b/i;
 
-// A trigger only counts as prose, never as code: a pasted spec mentioning the
-// identifier `remember()` was once stored verbatim as a 3292-char memory. So a
-// candidate is skipped when it sits inside a code span or fence (odd backtick
+// A trigger only counts as prose, never as code. A candidate is skipped when
+// it sits inside a code span or fence (odd backtick
 // count before it), is glued to a path/member access (preceded by a backtick,
 // dot, or slash), or is a call/code token (followed by "(" even across spaces,
 // or by an adjacent backtick - "remember that `bun test` ..." is still prose). The payload stops at the first
@@ -972,9 +1067,8 @@ async function captureFromPrompt(
   }
 }
 
-// project_fact rows are origin-scoped (a customer-B agent must not delete
-// customer-A's customer facts); the global type (stack_fact) is
-// maintainable from any project - that's what global means for it.
+// project_fact rows are origin-scoped (one customer's agent must not delete
+// another's facts); stack_fact is maintainable from any project.
 async function forget(
   args: ForgetArgs,
   ctx: { directory: string },
@@ -984,6 +1078,7 @@ async function forget(
     if (!Number.isInteger(id) || id <= 0) {
       return "ERROR: id must be a positive integer (the #id shown by memory_recall).";
     }
+    await ready();
     const deleted = await sql`
       DELETE FROM memories
       WHERE id = ${id} AND ${visibleRows(sql, ctx.directory)}
@@ -1004,11 +1099,8 @@ async function forget(
   }
 }
 
-// No dedup fall-through, by design: an update that lands close to another
-// memory is an intentional correction, not a dupe to reject. updated_at is
-// set; created_at is deliberately NOT bumped - the displayed date must keep
-// saying when the memory was learned, not when it was last edited. Omitted
-// tags/type are preserved, not reset to their defaults.
+// created_at is not bumped: the displayed date says when it was learned.
+// Omitted tags/type are preserved.
 async function updateMemory(
   args: UpdateArgs,
   ctx: { directory: string },
@@ -1020,10 +1112,11 @@ async function updateMemory(
     }
     const invalid = validateWrite(args);
     if (invalid) return invalid;
+    await ready();
 
     const tags = args.tags ?? [];
     const tagCond = Array.isArray(args.tags)
-      ? sql`tags = ${sql.array(tags, "text")},`
+      ? sql`tags = ${tagsParam(sql, tags)},`
       : sql``;
     const typeCond = args.type !== undefined
       ? sql`memory_type = ${args.type},`
@@ -1033,7 +1126,8 @@ async function updateMemory(
       SET content = ${args.content},
           ${tagCond}
           ${typeCond}
-          updated_at = now()
+          updated_at = ${nowSql(sql)},
+          embedding = NULL
       WHERE id = ${id} AND ${visibleRows(sql, ctx.directory)}
       RETURNING id
     ` as { id: number }[];
@@ -1046,38 +1140,27 @@ async function updateMemory(
       return `No memory #${id}; nothing updated.`;
     }
     invalidateInjection(ctx.directory);
-    // Content changed, so the embedding must follow - same fire-and-forget
-    // path as remember.
-    void embedAndStore(id, args.content);
+    // The UPDATE cleared the old vector, so a failed re-embed leaves the row
+    // keyword-only rather than matching content it no longer holds.
+    embedInBackground(id, args.content);
     return `Updated memory #${id}.${lengthNudge(args.content)}`;
   } catch (e: unknown) {
     return toolError("update", "update", e);
   }
 }
 
-// Embedding-similarity threshold for consolidate's second pass, measured for
-// embeddinggemma:300m rather than carried over from bge-m3: 0.83 clears every
-// distinct pair in bench/embeddinggemma-calibration.ts and gives FPR 0.002 on
-// the 808-pair bench/mempg-shaped-consolidate.ts with the detail cross-check.
-// Re-run both benches when changing the embed model.
+// Cosine threshold for consolidate's meaning pass, calibrated for
+// embeddinggemma:300m by the bench/ consolidate benches; re-run them on a model change.
 const CONSOLIDATE_EMBED_THRESHOLD = 0.83;
 
-// Mutual visibility for consolidation, mirroring visibleRows(): a project_fact
-// may only cluster with another row from its OWN project (regardless of that
-// row's type); the global type (stack_fact) clusters with anything.
-// Consolidation must never merge/delete across a boundary memory_forget and
-// memory_update already refuse to cross.
+// Mirrors visibleRows(): a project_fact clusters only within its own project,
+// so consolidation never crosses a boundary forget/update refuse to cross.
 function mutuallyVisible(client: SQL) {
   return client`((a.memory_type != 'project_fact' AND b.memory_type != 'project_fact') OR a.project = b.project)`;
 }
 
-// Same condition as mutuallyVisible(), but for the wording pass: its
-// similarity computation happens in TS (trigrams()/nearDupeSets()), not a SQL
-// join, so the guard has to be a plain boolean check on two already-fetched
-// rows instead of a SQL fragment. `a.project = b.project` is NULL-unsafe in
-// SQL (NULL never equals NULL); mirrored here explicitly rather than relying
-// on JS's `null === null` (true), which would silently disagree with the SQL
-// version for rows with no project set.
+// TS twin of mutuallyVisible() for the wording pass. SQL's `a.project =
+// b.project` is NULL-unsafe; mirrored explicitly since JS `null === null` is true.
 function mutuallyVisibleRows(
   a: { memory_type: string; project: string | null },
   b: { memory_type: string; project: string | null },
@@ -1086,24 +1169,16 @@ function mutuallyVisibleRows(
   return a.project !== null && b.project !== null && a.project === b.project;
 }
 
-// Excludes structurally templated, auto-generated content from the meaning
-// pass: verified against the real corpus (2026-09-19 audit, see AGENTS.md)
-// that three fixed sentence templates - background-task status logs from the
-// team/subagent system, session-compaction summaries, and per-app migration
-// checklist entries - drive cosine similarity high between GENUINELY
-// DIFFERENT facts (different task ids, different sessions, different apps)
-// purely because only a few words vary while the rest of the sentence is
-// boilerplate. This is a content-pattern check, not the `auto_capture` tag:
-// that tag was tested first and rejected - it sits on ~90% of BOTH correct
-// and incorrect merges alike in the real corpus, so excluding by tag would
-// gut the pass. The three patterns below have zero overlap with any
-// confirmed-correct meaning-pass merge in that same audit. A residual, much
-// smaller false-merge rate remains on natural-language content whose
-// wording happens to be structurally parallel (e.g. two genuinely different
-// systemd unit files described in near-identical sentences) - no threshold
-// or pattern separates that case from true duplicates without also losing
-// real ones (see AGENTS.md), so it is accepted rather than "fixed". Two
-// variants: the self-join (a/b aliases) and the plain single-table form.
+// Excludes structurally templated auto-logs from the meaning pass: background-
+// task status logs, session-compaction summaries and per-app migration
+// checklists score high on cosine between genuinely different facts, because
+// only a few words vary. Matched by content, not the `auto_capture` tag, which
+// sits on correct and incorrect merges alike. Structurally parallel natural
+// language (two different systemd units described alike) still false-merges
+// sometimes; no pattern separates that from true duplicates.
+// isTemplatedContent is the row filter on both backends; the SQL pair form
+// prefilters Postgres' O(n^2) self-join. ILIKE's `_` is one wildcard
+// character, and Postgres' `.` matches newlines, hence [\s\S].
 function isTemplatedAutoLogPair(client: SQL) {
   return client`(
     a.content ILIKE '%background task bg_%' OR b.content ILIKE '%background task bg_%'
@@ -1112,33 +1187,21 @@ function isTemplatedAutoLogPair(client: SQL) {
   )`;
 }
 
-function isTemplatedAutoLog(client: SQL) {
-  return client`(
-    content ILIKE '%background task bg_%'
-    OR content ILIKE '%session compacting for project%'
-    OR content ~ 'For APP.{0,3}[0-9]+.{0,3}\\('
-  )`;
+const TEMPLATED_AUTO_LOG = [/background task bg[\s\S]/i, /session compacting for project/i, /For APP[\s\S]{0,3}[0-9]+[\s\S]{0,3}\(/];
+function isTemplatedContent(content: string): boolean {
+  return TEMPLATED_AUTO_LOG.some((re) => re.test(content));
 }
 
-// A second, independent signal for the meaning pass, on top of embedding
-// similarity: no cosine threshold safely separates "same fact, reworded" from
-// "same sentence shape, different fact" - e.g. a rate limit changing from
-// 100 to 500 requests/minute, or a system-level vs a user-level systemd
-// unit path, both score high on cosine despite differing in exactly the
-// specific detail that matters. This extracts those specific details
-// (numbers, paths, capitalized names) with regexes only - no model call,
-// consistent with the earlier decision to drop the judge model entirely.
+// No cosine threshold separates "same fact, reworded" from "same shape,
+// different fact" (100 vs 500 req/min), so the meaning pass also compares
+// numbers, paths and capitalized names, extracted by regex (no model call).
 type DetailSet = {
   numbers: Set<string>;
   paths: Set<string>;
   properNouns: Set<string>;
 };
 
-// Deliberately coarse regexes, expected to need tuning against more real
-// content over time - proper-noun extraction especially: a lowercase
-// technical name (e.g. "bge-m3") is not capitalized and so is not caught by
-// this pass; that is an accepted gap, not a bug, for the first version of
-// this check.
+// Deliberately coarse: lowercase names like "bge-m3" are not caught.
 function extractDetails(content: string): DetailSet {
   const numbers = new Set<string>();
   for (const m of content.matchAll(/\b\d[\d,.:/-]*\b/g)) {
@@ -1166,27 +1229,16 @@ function extractDetails(content: string): DetailSet {
   return { numbers, paths, properNouns };
 }
 
-// A category conflicts only when BOTH sides have extracted values AND those
-// values are disjoint - absence on one side is not a conflict (nothing to
-// disagree with), per spec: "the API rate limit changed" (no number) must
-// not be blocked from merging with "...is 100/min" just because one side
-// lacks the detail the other has. "Disjoint" is judged by `equivalent`
-// rather than raw string equality, so formatting differences that don't
-// change meaning (see the three `*Equivalent` functions below) don't count
-// as a real conflict.
+// Conflicts only when both sides have values and none are `equivalent`;
+// absence on one side has nothing to disagree with.
 function categoryConflict(a: Set<string>, b: Set<string>, equivalent: (x: string, y: string) => boolean): boolean {
   if (a.size === 0 || b.size === 0) return false;
   for (const x of a) for (const y of b) if (equivalent(x, y)) return false;
   return true;
 }
 
-// Real notes format the same number differently ("1,000" vs "1000") without
-// meaning anything different, so strip thousands separators and compare
-// numerically when both sides parse as plain numbers. Version-shaped values
-// (2+ dot-separated digit groups, e.g. "2.5.0") get a separate rule: one
-// side being a strict prefix of the other ("2.5" vs "2.5.0") is treated as
-// imprecision, not a conflict - but "2.5" vs "3.0" still conflicts, since
-// that is a real version change, the exact thing this check exists to catch.
+// "1,000" equals "1000"; a version prefix ("2.5" vs "2.5.0") is imprecision,
+// but "2.5" vs "3.0" is a real change.
 const PLAIN_NUMBER = /^\d+(\.\d+)?$/;
 const VERSION_SHAPED = /^\d+(\.\d+)+$/;
 
@@ -1206,9 +1258,7 @@ function numbersEquivalent(x: string, y: string): boolean {
   return false;
 }
 
-// A trailing slash doesn't change what path is meant ("/var/log/app" vs
-// "/var/log/app/"); case stays significant, since mempg's actual content
-// describes real (case-sensitive Linux) filesystem paths.
+// Trailing slash ignored; case is significant on Linux paths.
 function pathsEquivalent(x: string, y: string): boolean {
   const strip = (v: string) => (v.length > 1 ? v.replace(/\/+$/, "") || v : v);
   return strip(x) === strip(y);
@@ -1220,12 +1270,7 @@ function properNounsEquivalent(x: string, y: string): boolean {
   return x.toLowerCase() === y.toLowerCase();
 }
 
-// Returns one human-readable reason per conflicting category (numbers,
-// paths, names), or an empty array when the pair has no conflict -
-// including the common case where neither side has any extractable detail
-// at all, which must never block a merge it has nothing to check. Reasons
-// always quote the raw extracted values, never the normalized form used
-// internally for comparison, so a report stays readable.
+// One reason per conflicting category, quoting raw (not normalized) values.
 function detailConflicts(a: DetailSet, b: DetailSet): string[] {
   const reasons: string[] = [];
   if (categoryConflict(a.numbers, b.numbers, numbersEquivalent)) {
@@ -1240,59 +1285,32 @@ function detailConflicts(a: DetailSet, b: DetailSet): string[] {
   return reasons;
 }
 
-// Deterministic consolidation, no model calls inside the plugin: find
-// near-duplicate clusters, keep the newest of each, delete the rest. The
-// deleted texts are returned verbatim so the CALLING agent - itself a model -
-// can merge any unique fact back into the survivor via memory_update. Merging
-// is language synthesis, which is the caller's job, not the plugin's.
-// Runs on demand (user-invoked), never on a schedule.
-//
-// Two passes, run in sequence (the second sees whatever the first already
-// removed): trigram similarity over content (wording-level restatements,
-// unchanged from the original implementation) and embedding cosine
-// similarity (meaning-level duplicates worded completely differently, the
-// case trigram structurally cannot reach). Each is capped at 25 clusters per
-// run so a wildly-duplicated corpus cannot turn into one huge report. The
-// meaning pass additionally gates every candidate pair through
-// detailConflicts: a specific number/path/name that differs between an
-// otherwise-similar pair blocks the auto-merge and routes that pair to
-// [meaning-uncertain] in the report instead (see extractDetails' comment).
+// Deterministic: keep the newest of each near-duplicate cluster, delete the rest,
+// and return deleted texts so the calling agent can merge unique facts back.
+// Pass 1 is trigram (wording), pass 2 embedding cosine (meaning), each capped at
+// 25 clusters; pass 2 routes detailConflicts pairs to [meaning-uncertain].
 async function consolidate(args: ConsolidateArgs = {}): Promise<string> {
   const dryRun = args.dryRun === true;
-  // Report wording only - the clustering/threshold/exclusion logic below runs
-  // identically in both modes; this just labels what happened to each row and
-  // gates whether the DELETE statements actually execute.
   const verb = dryRun ? "would remove" : "removed";
   try {
+    await ready();
     // --- Pass 1: wording (trigram similarity over content) ---
-    // Superseded rows are already-resolved history (an explicit decision was
-    // made about them via `supersedes`), not accidental near-duplicates for
-    // this pass to guess about - excluded the same way isTemplatedAutoLog
-    // excludes a different kind of not-a-candidate row.
+    // Superseded rows are resolved history, not accidental duplicates.
     const rows = await sql`
       SELECT id, content, coalesce(tags, '{}') AS tags, created_at, memory_type, project
       FROM memories
       WHERE superseded_by IS NULL
-      ORDER BY created_at DESC
-    ` as { id: number; content: string; tags: string[]; created_at: Date; memory_type: string; project: string | null }[];
+      ORDER BY created_at DESC, id DESC
+    ` as { id: number; content: string; tags: string[] | string; created_at: Date | string; memory_type: string; project: string | null }[];
 
-    // Greedy clustering newest-first: each row joins the first cluster whose
-    // representative (the newest member) it near-dupes. Trigram sets are built
-    // once (rebuilding per comparison made consolidate O(n^2) set-constructions,
-    // seconds at 5k rows), and a size-ratio prefilter skips pairs whose Jaccard
-    // can never reach the threshold.
+    // Greedy newest-first clustering against each cluster's newest member.
+    // Trigram sets are built once; a size-ratio prefilter skips hopeless pairs.
     type Entry = { row: (typeof rows)[number]; set: Set<string> };
     const entries: Entry[] = rows.map((row) => ({ row, set: trigrams(row.content) }));
     const clusters: Array<Array<Entry>> = [];
     for (const entry of entries) {
       const host = clusters.find((c) => {
-        // Comparisons are always against the cluster's anchor (c[0], the
-        // newest member that started it) - never against every existing
-        // member - so a single check here is enough to keep the whole
-        // cluster mutually visible: if the anchor is global, anything can
-        // join it (including rows from different projects, which is
-        // correct - the global row is what survives); if the anchor is a
-        // project_fact, only its own project's rows can join.
+        // Checking the anchor alone keeps the whole cluster mutually visible.
         if (!mutuallyVisibleRows(c[0].row, entry.row)) return false;
         const ra = c[0].set.size;
         const rb = entry.set.size;
@@ -1311,10 +1329,7 @@ async function consolidate(args: ConsolidateArgs = {}): Promise<string> {
     let removedGroups = 0;
     let uncertainPairs = 0;
     const report: string[] = [];
-    // Tracked regardless of dryRun: in a real run these rows are physically
-    // gone by the time pass 2 queries, so pass 2 never sees them; in a dry
-    // run nothing was actually deleted, so pass 2 must exclude them itself to
-    // see the same candidate set a real run would (and match its report).
+    // Tracked even in dryRun so pass 2 sees the same candidates a real run would.
     const wordingRemovedIds: number[] = [];
     for (const cluster of wordingGroups) {
       const survivor = cluster[0].row;
@@ -1322,53 +1337,71 @@ async function consolidate(args: ConsolidateArgs = {}): Promise<string> {
       wordingRemovedIds.push(...removedRows.map((r) => r.id));
       removed += removedRows.length;
       removedGroups++;
-      // Show what died so the calling agent can merge unique facts back into
-      // the survivor.
       report.push(
         `[wording] Kept #${survivor.id}: ${truncateMemory(survivor.content)}\n` +
           removedRows.map((r) => `  ${verb} #${r.id}: ${truncateMemory(r.content)}`).join("\n"),
       );
     }
     if (!dryRun && wordingRemovedIds.length > 0) {
-      await sql`DELETE FROM memories WHERE id = ANY(${sql.array(wordingRemovedIds, "int8")})`;
+      await sql`DELETE FROM memories WHERE id ${idIn(sql, wordingRemovedIds)}`;
     }
 
     // --- Pass 2: meaning (embedding cosine similarity) ---
-    // Only rows the wording pass left behind, only embedded rows (a row
-    // Ollama never reached - down at write time, pre-migration database - is
-    // simply not a candidate, same graceful-degradation posture as everywhere
-    // else), and never templated auto-logs (isTemplatedAutoLog - see its
-    // comment for why). The pairwise threshold join is pushed into Postgres
-    // (pgvector's <=> operator) rather than pulled into TS: cheap for the
-    // corpus sizes this tool already accepts an O(n^2) cost for (see the
-    // wording pass), and it lets the DB do the floating-point work instead of JS.
-    const embedPairs = (await sql`
-      SELECT a.id AS a_id, b.id AS b_id
-      FROM memories a
-      JOIN memories b ON a.id < b.id
-      WHERE a.embedding IS NOT NULL
-        AND b.embedding IS NOT NULL
-        AND a.superseded_by IS NULL
-        AND b.superseded_by IS NULL
-        AND a.id <> ALL(${sql.array(wordingRemovedIds, "int8")})
-        AND b.id <> ALL(${sql.array(wordingRemovedIds, "int8")})
-        AND (1 - (a.embedding <=> b.embedding)) >= ${CONSOLIDATE_EMBED_THRESHOLD}
-        AND ${mutuallyVisible(sql)}
-        AND NOT ${isTemplatedAutoLogPair(sql)}
-    `) as { a_id: number; b_id: number }[];
+    // Only embedded rows the wording pass left behind, never templated
+    // auto-logs. SQLite has no <=>, so it compares in TS (O(n^2), like pass 1).
+    type EmbedRow = { id: number; content: string; created_at: Date | string };
+    let embedRows: EmbedRow[] | undefined;
+    let embedPairs: { a_id: number; b_id: number }[];
+    if (SQLITE) {
+      const candidates = ((await sql`
+        SELECT id, content, created_at, memory_type, project, embedding
+        FROM memories
+        WHERE embedding IS NOT NULL AND superseded_by IS NULL
+          AND id NOT IN (SELECT value FROM json_each(${JSON.stringify(wordingRemovedIds)}))
+        ORDER BY created_at DESC, id DESC
+      `) as (EmbedRow & { memory_type: string; project: string | null; embedding: Uint8Array })[]).filter(
+        (r) => !isTemplatedContent(r.content),
+      );
+      const vecs = candidates.map((r) => asFloat32(r.embedding));
+      embedPairs = [];
+      for (let i = 0; i < candidates.length; i++) {
+        for (let j = i + 1; j < candidates.length; j++) {
+          const [a, b] = [candidates[i], candidates[j]];
+          if (vecs[i].length !== vecs[j].length || !mutuallyVisibleRows(a, b)) continue;
+          if (cosine(vecs[i], vecs[j]) < CONSOLIDATE_EMBED_THRESHOLD) continue;
+          embedPairs.push(a.id < b.id ? { a_id: a.id, b_id: b.id } : { a_id: b.id, b_id: a.id });
+        }
+      }
+      embedRows = candidates;
+    } else {
+      embedPairs = (await sql`
+        SELECT a.id AS a_id, b.id AS b_id
+        FROM memories a
+        JOIN memories b ON a.id < b.id
+        WHERE a.embedding IS NOT NULL
+          AND b.embedding IS NOT NULL
+          AND a.superseded_by IS NULL
+          AND b.superseded_by IS NULL
+          AND a.id <> ALL(${sql.array(wordingRemovedIds, "int8")})
+          AND b.id <> ALL(${sql.array(wordingRemovedIds, "int8")})
+          AND (1 - (a.embedding <=> b.embedding)) >= ${CONSOLIDATE_EMBED_THRESHOLD}
+          AND ${mutuallyVisible(sql)}
+          AND NOT ${isTemplatedAutoLogPair(sql)}
+      `) as { a_id: number; b_id: number }[];
+    }
 
     if (embedPairs.length > 0) {
       const linked = new Set<string>();
       for (const p of embedPairs) linked.add(`${p.a_id}:${p.b_id}`);
       const isLinked = (x: number, y: number) => (x < y ? linked.has(`${x}:${y}`) : linked.has(`${y}:${x}`));
 
-      const embedRows = (await sql`
-        SELECT id, content, coalesce(tags, '{}') AS tags, created_at
+      embedRows ??= ((await sql`
+        SELECT id, content, created_at
         FROM memories
-        WHERE embedding IS NOT NULL AND superseded_by IS NULL AND NOT ${isTemplatedAutoLog(sql)}
+        WHERE embedding IS NOT NULL AND superseded_by IS NULL
           AND id <> ALL(${sql.array(wordingRemovedIds, "int8")})
-        ORDER BY created_at DESC
-      `) as { id: number; content: string; tags: string[]; created_at: Date }[];
+        ORDER BY created_at DESC, id DESC
+      `) as EmbedRow[]).filter((r) => !isTemplatedContent(r.content));
 
       // Same greedy "newest anchors a cluster" shape as the wording pass,
       // matched by the pair list above instead of a text-similarity test.
@@ -1383,11 +1416,8 @@ async function consolidate(args: ConsolidateArgs = {}): Promise<string> {
       for (const cluster of meaningGroups) {
         const survivor = cluster[0];
         const survivorDetails = extractDetails(survivor.content);
-        // Detail cross-check (see extractDetails/detailConflicts): a pair
-        // only auto-merges if, on top of the embedding threshold, no
-        // specific number/path/name conflicts between it and the survivor.
-        // A conflicting member is pulled OUT of the auto-merge on its own -
-        // it does not void the rest of an otherwise-clean cluster.
+        // A detail-conflicting member leaves the auto-merge alone; the rest
+        // of the cluster still merges.
         const clean: (typeof cluster)[number][] = [];
         const uncertain: Array<{ row: (typeof cluster)[number]; reasons: string[] }> = [];
         for (const row of cluster.slice(1)) {
@@ -1397,7 +1427,7 @@ async function consolidate(args: ConsolidateArgs = {}): Promise<string> {
         }
 
         if (!dryRun && clean.length > 0) {
-          await sql`DELETE FROM memories WHERE id = ANY(${sql.array(clean.map((r) => r.id), "int8")})`;
+          await sql`DELETE FROM memories WHERE id ${idIn(sql, clean.map((r) => r.id))}`;
         }
         removed += clean.length;
         if (clean.length > 0) {
@@ -1531,10 +1561,7 @@ const TOOL_SPECS: readonly ToolSpec[] = [
     name: "memory_remember",
     label: "Memory Remember",
     readOnly: false,
-    // This description is the only place the write policy is guaranteed to
-    // reach the model: it is in the tool schema every session, whereas the
-    // injected block is missing whenever injection fails (DB down, deadline)
-    // and the user may have no project instructions at all.
+    // The only place the write policy always reaches the model: injection can fail.
     description:
       "Store a durable memory. This is the only way anything you learn survives past " +
       "this session - unwritten context is lost permanently when the session ends, so " +
@@ -1568,9 +1595,6 @@ const TOOL_SPECS: readonly ToolSpec[] = [
             "project_fact (default) = true about THIS specific project/customer only " +
             "(an environment quirk, a customer's specific request, a one-off workaround) " +
             "- visible only in this project unless the caller asks for global search. " +
-            "episodic = reserved for a future feature; visible everywhere like stack_fact, " +
-            "but nothing assigns it automatically today - default to project_fact or " +
-            "stack_fact unless you have a specific reason to use it. " +
             "Test: would this fact help in a different customer's repo using the same " +
             "tools? If yes, stack_fact. If no, project_fact.",
         },
@@ -1652,10 +1676,6 @@ const TOOL_SPECS: readonly ToolSpec[] = [
     name: "memory_consolidate",
     label: "Memory Consolidate",
     readOnly: false,
-    // User-invoked cleanup, not a write-path gate: writes never reject on
-    // duplicates, so call this when the corpus has accumulated near-dupes.
-    // The deleted texts come back in the result so the calling agent can
-    // merge unique facts into the survivors via memory_update.
     description:
       "Remove near-duplicate memories: keeps the newest of each near-duplicate group anywhere in the store and deletes the rest, returning the removed texts. " +
       "Finds duplicates two ways - matching wording (trigram similarity) and matching meaning (embedding similarity, catches the same fact stated in different words). " +
@@ -1690,7 +1710,7 @@ const TOOL_SPECS: readonly ToolSpec[] = [
           type: "boolean",
           description:
             "Also count tags from other projects' project_fact memories (default: only this " +
-            "project's project_fact memories, plus all stack_fact/episodic memories, which are always global).",
+            "project's project_fact memories, plus all stack_fact memories, which are always global).",
         },
       },
       additionalProperties: false,
@@ -1791,11 +1811,8 @@ function isObject(x: unknown): x is Record<string, unknown> {
   return typeof x === "object" && x !== null;
 }
 
-// Deterministic gate for the session_stop checkpoint: counts tool calls made
-// since the latest user prompt, and skips turns that already wrote memory -
-// via memory_remember/memory_update, or via keyword capture of the prompt
-// itself (re-running extractMemoryRequest, the same test the capture path
-// uses, so a captured fact is never nudged into a second write).
+// Counts tool calls since the latest prompt; skips turns that already wrote
+// memory, including via keyword capture (so a captured fact isn't written twice).
 function needsMemoryCheckpoint(messages: readonly unknown[]): boolean {
   let lastUser = -1;
   let promptContent: unknown;
@@ -1828,11 +1845,6 @@ function needsMemoryCheckpoint(messages: readonly unknown[]): boolean {
 }
 
 const inflightCaptures = new Set<Promise<void>>();
-
-function trackCapture(p: Promise<void>): void {
-  inflightCaptures.add(p);
-  void p.finally(() => inflightCaptures.delete(p));
-}
 
 async function settleCaptures(): Promise<void> {
   await Promise.all(inflightCaptures);
@@ -1869,11 +1881,10 @@ function mempg(pi: ExtensionAPI): void {
 
   pi.on("session_start", () => {
     // Open the pool before the first prompt needs it: Bun connects lazily, so
-    // otherwise the TCP + SCRAM handshake is paid inside the first injection.
-    void sql`SELECT 1`.catch(() => {});
-    // Warm the embedding model off the request path: a cold load is ~2-3s
-    // (over the query budget), so without this the first hybrid query of a
-    // session falls back to keyword-only. keep_alive pins it between requests.
+    // otherwise the TCP + SCRAM handshake (or SQLite's schema setup) is paid
+    // inside the first injection.
+    void ready().then(() => sql`SELECT 1`).catch(() => {});
+    // Warm the embed model so the first hybrid query isn't a cold load.
     void embed(["mempg session warmup"], EMBED_WRITE_TIMEOUT_MS);
   });
 
@@ -1881,13 +1892,10 @@ function mempg(pi: ExtensionAPI): void {
     // Injection: extend the event's systemPrompt (it carries earlier
     // extensions' chained overrides); cwd is read per event since /move changes it.
     const output: { system: string[] } = { system: [] };
-    // Keyword capture: a trigger phrase ("remember that ...") stores the first
-    // paragraph after it verbatim (code/length guards apply) through the normal write path. No LLM call, and
-    // the prompt is never mutated. Main session only: subagent prompts are
-    // written by the parent agent, not the user.
+    // Keyword capture, main session only: subagent prompts aren't the user's.
     if (ctx.agent.kind === "main" && extractMemoryRequest(event.prompt) !== null) {
       if (firstSighting(event.prompt)) {
-        trackCapture(captureFromPrompt(event.prompt, ctx.cwd, ctx.sessionManager.getSessionId()));
+        track(inflightCaptures, captureFromPrompt(event.prompt, ctx.cwd, ctx.sessionManager.getSessionId()));
       }
       // memory_remember is always loaded and its description says to write on
       // user statements, so without this the model stores the same request a
@@ -1927,9 +1935,8 @@ function mempg(pi: ExtensionAPI): void {
 }
 
 const __internals = {
-  get sql() {
-    return sql;
-  },
+  sql,
+  ready,
   withDeadline,
   formatBlock,
   handleTransform,
@@ -1944,6 +1951,7 @@ const __internals = {
   needsMemoryCheckpoint,
   captureFromPrompt,
   settleCaptures,
+  settleEmbeddings,
   TOOL_SPECS,
   toZod,
   invalidateInjection,
@@ -1963,9 +1971,12 @@ const __internals = {
   capPromptQuery,
   buildRecencyQuery,
   embed,
+  embedAndStore,
   CONSOLIDATE_EMBED_THRESHOLD,
   mutuallyVisibleRows,
-  isTemplatedAutoLog,
+  isTemplatedAutoLogPair,
+  isTemplatedContent,
+  vectorParam,
   extractDetails,
   detailConflicts,
   rrfMerge,
@@ -1982,8 +1993,7 @@ const __internals = {
   dispose,
 };
 
-// Attach test internals to the default export instead of as a named export
-// (established contract; module exports stay limited to default).
+// Test internals ride on the default export; module exports stay default-only.
 export default Object.assign(mempg, { __internals }) as typeof mempg & {
   __internals: typeof __internals;
 };
