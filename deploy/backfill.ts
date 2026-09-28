@@ -49,7 +49,7 @@ while (true) {
     vecs.push(...part);
   }
   const ids = batch.map((r) => r.id);
-  const lits = vecs.map(__internals.vectorLiteral);
+  const lits = vecs.map((v) => JSON.stringify(v));
   await sql`
     UPDATE memories m SET embedding = v.e::vector
     FROM (SELECT unnest(${sql.array(ids, "integer")}) AS id, unnest(${sql.array(lits, "text")}) AS e) v

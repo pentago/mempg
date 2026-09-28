@@ -4,10 +4,7 @@
     "includes": ["mempg.ts", "tests/**/*.ts", "bench/**/*.ts"]
   },
   "formatter": {
-    "enabled": false,
-    "indentStyle": "space",
-    "indentWidth": 2,
-    "lineWidth": 100
+    "enabled": false
   },
   "assist": {
     "actions": {
@@ -20,12 +17,6 @@
     "enabled": true,
     "rules": {
       "preset": "recommended"
-    }
-  },
-  "javascript": {
-    "formatter": {
-      "quoteStyle": "double",
-      "semicolons": "always"
     }
   }
 }

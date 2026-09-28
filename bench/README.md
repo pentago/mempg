@@ -26,8 +26,8 @@ bun run bench:embeddinggemma-calibration
 bun run bench:mempg-shaped-consolidate [--dims 768] [--ollama http://localhost:11434]
 ```
 
-- Builds 808 labeled pairs in-process from the infra vocabulary in
-  `bench/config.ts`, with injected numbers, paths and proper nouns. Categories:
+- Builds 808 labeled pairs in-process from the infra vocabulary at the top of
+  `mempg-shaped-consolidate.ts`, with injected numbers, paths and proper nouns. Categories:
   - `duplicate`: same fact, same injected value.
   - `update-*`: same shape, changed value, i.e. a genuinely different fact.
   - `distinct-related`: same topic, different aspect.

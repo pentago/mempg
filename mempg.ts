@@ -66,7 +66,7 @@ function makeSql(cfg: DbConfig): SQL {
 
 const sql = makeSql(defaultConfig);
 
-export interface MemoryRow {
+interface MemoryRow {
   id: number;
   content: string;
   tags: string[] | null;
@@ -154,7 +154,7 @@ const OLLAMA_PORT = Number(process.env.MEMPG_OLLAMA_PORT) || 11434;
 const EMBED_MODEL = process.env.MEMPG_EMBED_MODEL || "embeddinggemma:300m";
 let ollamaBase = `http://${OLLAMA_HOST}:${OLLAMA_PORT}`;
 
-// Warm bge-m3 embed is ~20ms (measured 2026-09-18, RTX 5070); a cold model
+// A warm embed was ~20ms (bge-m3, measured 2026-09-18, RTX 5070); a cold model
 // load is ~2-3s, over the injection deadline - so session_start fires a warm-up and
 // every request passes keep_alive to keep the model resident. The query budget
 // only trips when racing that warm-up or a wedged daemon, and both fall back
@@ -182,11 +182,6 @@ async function embed(texts: string[], timeoutMs: number): Promise<number[][] | n
     logError("embed", `mempg embedding unavailable, keyword-only: ${e instanceof Error ? e.message : String(e)}`);
     return null;
   }
-}
-
-// pgvector literal, e.g. "[0.1,-0.2,...]", sent as a text param cast to vector.
-function vectorLiteral(v: number[]): string {
-  return `[${v.join(",")}]`;
 }
 
 // Reciprocal rank fusion (k=60, the standard constant): a row scores
@@ -231,14 +226,9 @@ function hybridMerge<T extends { content: string }>(keywordRows: T[], vectorRows
 async function embedAndStore(id: number, content: string): Promise<void> {
   const vecs = await embed([content], EMBED_WRITE_TIMEOUT_MS);
   if (!vecs) return;
-  await storeEmbedding(id, vecs[0]);
-}
-
-// remember() already holds the fresh embedding when the smart-write prefilter
-// ran; storing it directly skips the redundant second embed.
-async function storeEmbedding(id: number, vec: number[]): Promise<void> {
   try {
-    await sql`UPDATE memories SET embedding = ${vectorLiteral(vec)}::vector WHERE id = ${id}`;
+    // pgvector literal "[0.1,-0.2,...]", sent as a text param cast to vector.
+    await sql`UPDATE memories SET embedding = ${JSON.stringify(vecs[0])}::vector WHERE id = ${id}`;
   } catch (e: unknown) {
     logError("embed-write", `mempg embedding store failed for #${id}: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -276,10 +266,6 @@ function trigrams(text: string): Set<string> {
   return out;
 }
 
-function nearDupe(a: string, b: string): boolean {
-  return nearDupeSets(trigrams(a), trigrams(b));
-}
-
 function nearDupeSets(A: Set<string>, B: Set<string>): boolean {
   if (A.size === 0 || B.size === 0) return false;
   let inter = 0;
@@ -295,7 +281,7 @@ function collapseDupes(rows: InjectionRow[]): InjectionRow[] {
   const kept: InjectionRow[] = [];
   for (const row of rows) {
     if (kept.length >= 5) break;
-    if (!kept.some((k) => nearDupe(k.content, row.content))) kept.push(row);
+    if (!kept.some((k) => nearDupeSets(trigrams(k.content), trigrams(row.content)))) kept.push(row);
   }
   return kept;
 }
@@ -359,19 +345,10 @@ function formatBlock(rows: InjectionRow[], projectDir: string): string {
 // guidance-only block, so no-match prompts stop re-querying.
 const injectionCache = new Map<string, string>();
 
-// djb2 - just a stable key shortener; a same-hash different-prompt collision
-// would serve a stale block, which remember/forget invalidation clears.
-function hashQuery(text: string): string {
-  let h = 5381;
-  for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0;
-  return (h >>> 0).toString(36);
-}
-
 // The user's prompt is the retrieval signal; capped because a query is a
 // query, not a transcript - FTS is not helped by thousands of characters.
 function capPromptQuery(text: string): string {
-  const t = text.trim();
-  return t.length > 512 ? t.slice(0, 512) : t;
+  return text.trim().slice(0, 512);
 }
 
 // Visibility rule shared by recall and both injection builders: the global
@@ -498,46 +475,37 @@ async function handleTransform(
 ): Promise<void> {
   if (!directory) return;
   const query = injectionMode === "relevance" ? prompt.trim() : "";
-  const cacheKey = `${directory}\u0001${hashQuery(query)}`;
+  const cacheKey = `${directory}\u0001${Bun.hash(query).toString(36)}`;
   const cached = injectionCache.get(cacheKey);
   if (cached !== undefined) {
     if (cached) output.system.push(cached);
     return;
   }
   try {
-    let rows: InjectionRow[];
+    const inject = (q: unknown) => withDeadline(q as PromiseLike<InjectionRow[]>, 1000);
+    let rows: InjectionRow[] = [];
     const tsQuery = orTsQuery(query);
     if (tsQuery) {
       // Hybrid: the keyword half always runs; the embedding half is started
-      // concurrently so a warm bge-m3 (~20ms) hides behind the keyword
+      // concurrently so a warm embed (~20ms) hides behind the keyword
       // round-trip. Null embedding (Ollama down/timeout) or a failed vector
       // query (pre-migration database, DeadlineError) degrade to keyword-only.
       const embedding = embed([query], EMBED_QUERY_TIMEOUT_MS);
-      const keywordRows = await withDeadline(
-        buildRelevanceQuery(sql, tsQuery, directory) as unknown as PromiseLike<InjectionRow[]>,
-        1000,
-      );
+      const keywordRows = await inject(buildRelevanceQuery(sql, tsQuery, directory));
       rows = keywordRows;
       const vecs = await embedding;
       if (vecs) {
-        const vectorRows = await withDeadline(
-          buildVectorQuery(sql, vectorLiteral(vecs[0]), directory) as unknown as PromiseLike<InjectionRow[]>,
-          1000,
-        ).catch((e: unknown) => {
+        const vectorRows = await inject(buildVectorQuery(sql, JSON.stringify(vecs[0]), directory)).catch((e: unknown) => {
           logError("embed-query", `mempg vector query failed, keyword-only: ${e instanceof Error ? e.message : String(e)}`);
           return null;
         });
         if (vectorRows) rows = hybridMerge(keywordRows, vectorRows);
       }
-      if (rows.length === 0) {
-        // No retrieval signal at all for this prompt - recency beats an empty
-        // block. The vector half alone counts as a signal: a zero-overlap
-        // paraphrase is exactly what embeddings are for.
-        rows = await withDeadline(buildRecencyQuery(sql, directory) as unknown as PromiseLike<InjectionRow[]>, 1000);
-      }
-    } else {
-      rows = await withDeadline(buildRecencyQuery(sql, directory) as unknown as PromiseLike<InjectionRow[]>, 1000);
     }
+    // No retrieval signal at all (no prompt, or nothing matched) - recency
+    // beats an empty block. The vector half alone counts as a signal: a
+    // zero-overlap paraphrase is exactly what embeddings are for.
+    if (rows.length === 0) rows = await inject(buildRecencyQuery(sql, directory));
     const block = formatBlock(collapseDupes(rows), directory);
     // Evict oldest entry when cache exceeds 32
     if (injectionCache.size >= 32) {
@@ -608,31 +576,12 @@ function lengthNudge(content: string): string {
 const MEMORY_TYPES = ["stack_fact", "project_fact", "episodic"] as const;
 type MemoryType = (typeof MEMORY_TYPES)[number];
 
-function resolveMemoryType(raw: unknown): MemoryType {
-  return MEMORY_TYPES.includes(raw as MemoryType) ? (raw as MemoryType) : "project_fact";
-}
-
 // Raw JSON Schema input is not coerced for us: a model sending "3" or null for
 // limit would otherwise reach Postgres as LIMIT NaN.
-function resolveLimit(raw: unknown): number {
+function clampInt(raw: unknown, fallback: number, max: number): number {
   const n = Number(raw);
-  if (!Number.isFinite(n)) return 10;
-  return Math.min(Math.max(Math.trunc(n), 1), 20);
-}
-
-// memory_tags lists distinct tags, not rows - a much cheaper result per unit,
-// so its default and cap are both higher than recall's. Ordering (uses DESC,
-// tag ASC) is not itself the issue an earlier review raised; the default
-// value was. Verified against this project's own live corpus: it already
-// carries ~50 distinct tags, so a default of 50 silently starved rare/new
-// tags out of the ordinary (no-limit) call - exactly the tags this tool
-// exists to surface (an established, high-count tag needs no lookup; a
-// candidate that might already exist as a one-off does). 200 gives a
-// realistic personal/team corpus headroom before the hard 500 cap.
-function resolveTagsLimit(raw: unknown): number {
-  const n = Number(raw);
-  if (!Number.isFinite(n)) return 200;
-  return Math.min(Math.max(Math.trunc(n), 1), 500);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(Math.trunc(n), 1), max);
 }
 
 // The model sees a generic failure; the operator sees the real message in the
@@ -654,7 +603,7 @@ async function recall(
   ctx: { directory: string; sessionID?: string },
 ): Promise<string> {
   try {
-    const limit = resolveLimit(args.limit);
+    const limit = clampInt(args.limit, 10, 20);
     // Visibility: the global type (stack_fact) everywhere; project_fact only
     // from the origin project unless the caller opts in with global: true.
     const visibleCond = args.global ? sql`` : sql`AND ${visibleRows(sql, ctx.directory)}`;
@@ -685,7 +634,7 @@ async function recall(
       ? sql`ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsQuery})) + ${crossSessionBoost(sql)} DESC`
       : sql`ORDER BY created_at DESC`;
 
-    // Hybrid: with a searchable query, embed it concurrently so a warm bge-m3
+    // Hybrid: with a searchable query, embed it concurrently so a warm embed
     // (~20ms) hides behind the keyword round-trip; the vector half then merges
     // via RRF. Any embedding failure (Ollama down, no embedding column yet)
     // degrades to exactly the pre-hybrid keyword-only behavior.
@@ -713,7 +662,7 @@ async function recall(
                project, memory_type, superseded_by
         FROM memories
         WHERE embedding IS NOT NULL ${visibleCond} ${supersededCond} ${tagCond}
-        ORDER BY embedding <=> ${vectorLiteral(vecs[0])}::vector
+        ORDER BY embedding <=> ${JSON.stringify(vecs[0])}::vector
         LIMIT ${EMBED_CANDIDATES}
       ` as unknown as Promise<(MemoryRow & { memory_type: string; superseded_by: number | null })[]>).catch((e: unknown) => {
         logError("embed-query", `mempg vector query failed, keyword-only: ${e instanceof Error ? e.message : String(e)}`);
@@ -782,7 +731,9 @@ async function recall(
 // exercise a genuinely empty table without touching real data.
 async function listTags(args: TagsArgs, ctx: { directory: string }, client: SQL = sql): Promise<string> {
   try {
-    const limit = resolveTagsLimit(args.limit);
+    // Distinct tags are cheap per row, so the default is high: 50 starved rare
+    // one-off tags out of a ~50-tag corpus - the tags this tool exists to surface.
+    const limit = clampInt(args.limit, 200, 500);
     const visibleCond = args.global ? client`` : client`AND ${visibleRows(client, ctx.directory)}`;
     const rows = await client`
       SELECT tag, count(*) AS uses
@@ -910,45 +861,35 @@ async function remember(
     const tags = args.tags ?? [];
     const basename = ctx.directory.split('/').pop() ?? ctx.directory;
 
-    // sql.array(tags) alone encodes text[] with quoted elements under bun 1.4.2;
-    // the element type hint is required for clean array storage.
-    let newId: number;
-    if (supersedesId !== undefined) {
-      // Atomic: insert the new memory and link the old one in one
-      // transaction. If the supersede target is unreachable (wrong project,
-      // or gone), the whole thing rolls back - no orphaned insert.
-      newId = await sql.begin(async (tx) => {
-        const inserted = await tx`
-          INSERT INTO memories (content, tags, session_id, project, memory_type)
-          VALUES (${args.content}, ${tx.array(tags, "text")}, ${ctx.sessionID}, ${ctx.directory}, ${resolveMemoryType(args.type)})
-          RETURNING id
-        ` as { id: number }[];
-        const id = inserted[0].id;
-
-        const linked = await tx`
-          UPDATE memories SET superseded_by = ${id}
-          WHERE id = ${supersedesId} AND ${visibleRows(tx, ctx.directory)}
-          RETURNING id
-        ` as { id: number }[];
-        if (linked.length === 0) {
-          const exists = await tx`SELECT project, memory_type FROM memories WHERE id = ${supersedesId}` as { project: string; memory_type: string }[];
-          if (exists.length > 0) {
-            throw new SupersedeError(
-              `memory #${supersedesId} is a ${exists[0].memory_type} belonging to ${exists[0].project}; cannot supersede it from here. Only that project's agent can mark it superseded.`,
-            );
-          }
-          throw new SupersedeError(`no memory #${supersedesId}; nothing to supersede.`);
-        }
-        return id;
-      });
-    } else {
-      const inserted = await sql`
+    // Atomic: insert the new memory and (optionally) link the old one in one
+    // transaction. If the supersede target is unreachable (wrong project, or
+    // gone), the whole thing rolls back - no orphaned insert.
+    const newId = await sql.begin(async (tx) => {
+      // sql.array(tags) alone encodes text[] with quoted elements under bun 1.4.2;
+      // the element type hint is required for clean array storage.
+      const [{ id }] = await tx`
         INSERT INTO memories (content, tags, session_id, project, memory_type)
-        VALUES (${args.content}, ${sql.array(tags, "text")}, ${ctx.sessionID}, ${ctx.directory}, ${resolveMemoryType(args.type)})
+        VALUES (${args.content}, ${tx.array(tags, "text")}, ${ctx.sessionID}, ${ctx.directory}, ${args.type ?? "project_fact"})
         RETURNING id
       ` as { id: number }[];
-      newId = inserted[0].id;
-    }
+      if (supersedesId === undefined) return id;
+
+      const linked = await tx`
+        UPDATE memories SET superseded_by = ${id}
+        WHERE id = ${supersedesId} AND ${visibleRows(tx, ctx.directory)}
+        RETURNING id
+      ` as { id: number }[];
+      if (linked.length === 0) {
+        const exists = await tx`SELECT project, memory_type FROM memories WHERE id = ${supersedesId}` as { project: string; memory_type: string }[];
+        if (exists.length > 0) {
+          throw new SupersedeError(
+            `memory #${supersedesId} is a ${exists[0].memory_type} belonging to ${exists[0].project}; cannot supersede it from here. Only that project's agent can mark it superseded.`,
+          );
+        }
+        throw new SupersedeError(`no memory #${supersedesId}; nothing to supersede.`);
+      }
+      return id;
+    });
 
     // Fire-and-forget: a failure leaves embedding NULL, keyword search keeps
     // working, and the backfill (deploy/backfill.ts) fills the gap later.
@@ -1085,7 +1026,7 @@ async function updateMemory(
       ? sql`tags = ${sql.array(tags, "text")},`
       : sql``;
     const typeCond = args.type !== undefined
-      ? sql`memory_type = ${resolveMemoryType(args.type)},`
+      ? sql`memory_type = ${args.type},`
       : sql``;
     const updated = await sql`
       UPDATE memories
@@ -1114,31 +1055,11 @@ async function updateMemory(
   }
 }
 
-// Embedding-similarity threshold for consolidate's second pass. Originally
-// calibrated for bge-m3 (measured 2026-09-19); re-verified from scratch for
-// embeddinggemma:300m (the model mempg.ts now defaults to - see the
-// "complete the embeddinggemma:300m migration" spec, repo history) since a
-// different model has no guaranteed relationship to another model's cosine
-// distribution and that must be measured, not assumed.
-//
-// Re-ran the exact same calibration methodology: the same 26 hand-labeled
-// pairs (bench/embeddinggemma-calibration.ts) re-embedded with
-// embeddinggemma:300m. Result: duplicates 0.789-0.925 (mean .866), updates
-// 0.540-0.813 (mean .669), distinct pairs topped out at 0.749 (mean .473) -
-// a cleaner duplicate/distinct gap than bge-m3 had (0.04 vs 0.024). 0.83
-// still sits clear of every distinct pair here too.
-//
-// Also re-ran the larger, more reliable mempg-shaped-consolidate.ts bench
-// (808 pairs, purpose-built to include the exact update-shape failure modes
-// - rate limit, path, port, retry-count changes) at 0.83 with
-// embeddinggemma:300m: FPR 0.002 with the detail cross-check applied (vs
-// bge-m3's 0.005), every update-* category pair that reached the threshold
-// was still caught (0 clean merges across all update-* rows, same gate
-// bge-m3 passed), and false-negative cost dropped too (1/281 candidates
-// wrongly blocked, 0.4%, vs bge-m3's 1.6%). The 26-pair set confirms 0.83
-// clears every distinct pair (its own zero-false-merge floor is 0.75); the
-// larger bench supports keeping 0.83 - re-measured, not carried over on the
-// assumption "the model switch shouldn't matter."
+// Embedding-similarity threshold for consolidate's second pass, measured for
+// embeddinggemma:300m rather than carried over from bge-m3: 0.83 clears every
+// distinct pair in bench/embeddinggemma-calibration.ts and gives FPR 0.002 on
+// the 808-pair bench/mempg-shaped-consolidate.ts with the detail cross-check.
+// Re-run both benches when changing the embed model.
 const CONSOLIDATE_EMBED_THRESHOLD = 0.83;
 
 // Mutual visibility for consolidation, mirroring visibleRows(): a project_fact
@@ -1277,7 +1198,6 @@ function isVersionPrefix(x: string, y: string): boolean {
 }
 
 function numbersEquivalent(x: string, y: string): boolean {
-  if (x === y) return true;
   const nx = x.replace(/,/g, "");
   const ny = y.replace(/,/g, "");
   if (nx === ny) return true;
@@ -1399,12 +1319,7 @@ async function consolidate(args: ConsolidateArgs = {}): Promise<string> {
     for (const cluster of wordingGroups) {
       const survivor = cluster[0].row;
       const removedRows = cluster.slice(1).map((e) => e.row);
-      if (!dryRun) {
-        for (const r of removedRows) {
-          await sql`DELETE FROM memories WHERE id = ${r.id}`;
-        }
-      }
-      for (const r of removedRows) wordingRemovedIds.push(r.id);
+      wordingRemovedIds.push(...removedRows.map((r) => r.id));
       removed += removedRows.length;
       removedGroups++;
       // Show what died so the calling agent can merge unique facts back into
@@ -1413,6 +1328,9 @@ async function consolidate(args: ConsolidateArgs = {}): Promise<string> {
         `[wording] Kept #${survivor.id}: ${truncateMemory(survivor.content)}\n` +
           removedRows.map((r) => `  ${verb} #${r.id}: ${truncateMemory(r.content)}`).join("\n"),
       );
+    }
+    if (!dryRun && wordingRemovedIds.length > 0) {
+      await sql`DELETE FROM memories WHERE id = ANY(${sql.array(wordingRemovedIds, "int8")})`;
     }
 
     // --- Pass 2: meaning (embedding cosine similarity) ---
@@ -1478,8 +1396,8 @@ async function consolidate(args: ConsolidateArgs = {}): Promise<string> {
           else clean.push(row);
         }
 
-        for (const r of clean) {
-          if (!dryRun) await sql`DELETE FROM memories WHERE id = ${r.id}`;
+        if (!dryRun && clean.length > 0) {
+          await sql`DELETE FROM memories WHERE id = ANY(${sql.array(clean.map((r) => r.id), "int8")})`;
         }
         removed += clean.length;
         if (clean.length > 0) {
@@ -1529,13 +1447,11 @@ async function consolidate(args: ConsolidateArgs = {}): Promise<string> {
   }
 }
 
-// Clears every cache entry for the directory - relevance mode keys by
-// directory + prompt hash, so a write invalidates them all.
+// Clears every cache entry for the directory - the cache keys by directory +
+// prompt hash, so a write invalidates them all.
 function invalidateInjection(directory: string): void {
   for (const key of [...injectionCache.keys()]) {
-    if (key === directory || key.startsWith(`${directory}\u0001`)) {
-      injectionCache.delete(key);
-    }
+    if (key.startsWith(`${directory}\u0001`)) injectionCache.delete(key);
   }
 }
 
@@ -1941,7 +1857,7 @@ function mempg(pi: ExtensionAPI): void {
   // A before_agent_start chain can re-run for one submission; capture must
   // write once per distinct prompt per session.
   const firstSighting = (prompt: string): boolean => {
-    const key = `${prompt.length}:${hashQuery(prompt)}`;
+    const key = Bun.hash(prompt).toString(36);
     if (seenPrompts.has(key)) return false;
     seenPrompts.add(key);
     if (seenPrompts.size > SEEN_PROMPTS_MAX) {
@@ -2014,8 +1930,6 @@ const __internals = {
   get sql() {
     return sql;
   },
-  truncateMemory,
-  sanitizeMemory,
   withDeadline,
   formatBlock,
   handleTransform,
@@ -2025,27 +1939,20 @@ const __internals = {
   updateMemory,
   consolidate,
   listTags,
-  resolveTagsLimit,
   retag,
-  validateRetag,
-  lengthNudge,
   extractMemoryRequest,
   needsMemoryCheckpoint,
-  CHECKPOINT_MIN_TOOL_CALLS,
-  CHECKPOINT_NOTE,
   captureFromPrompt,
   settleCaptures,
   TOOL_SPECS,
   toZod,
   invalidateInjection,
   resolveSslMode,
-  resolveLimit,
-  resolveMemoryType,
+  clampInt,
   validateWrite,
   logError,
   setLogSink,
   toolError,
-  rateLimitOk,
   resetRateLimit,
   get injectionMode() {
     return injectionMode;
@@ -2054,19 +1961,8 @@ const __internals = {
     injectionMode = mode;
   },
   capPromptQuery,
-  hashQuery,
-  orTsQuery,
   buildRecencyQuery,
-  buildRelevanceQuery,
-  buildVectorQuery,
-  visibleRows,
-  notSuperseded,
-  crossSessionJoin,
-  crossSessionBoost,
   embed,
-  EMBED_WRITE_TIMEOUT_MS,
-  embedAndStore,
-  storeEmbedding,
   CONSOLIDATE_EMBED_THRESHOLD,
   mutuallyVisibleRows,
   isTemplatedAutoLog,
@@ -2074,12 +1970,11 @@ const __internals = {
   detailConflicts,
   rrfMerge,
   hybridMerge,
-  vectorLiteral,
   get ollamaBase() {
     return ollamaBase;
   },
   // Test hook: point the embed client at a dead endpoint to exercise the
-  // keyword-only degradation paths (module state, like injectionMode).
+  // keyword-only degradation paths (module state).
   setOllamaBase(base: string) {
     ollamaBase = base;
   },

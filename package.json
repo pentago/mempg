@@ -3,10 +3,8 @@
   "version": "0.1.0",
   "type": "module",
   "description": "Postgres-backed persistent memory extension for oh-my-pi (omp)",
-  "main": "mempg.ts",
   "scripts": {
     "check": "biome check .",
-    "format": "biome format --write .",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "bench:mempg-shaped-consolidate": "bun bench/mempg-shaped-consolidate.ts",

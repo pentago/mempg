@@ -60,7 +60,7 @@ bun run backfill     # embed NULL-embedding rows
 pre-commit install && pre-commit install --hook-type pre-push
 ```
 
-- **Formatter**: Biome's formatter is **disabled** and the source is hand-wrapped. Never run `bun run format` alongside logic changes.
+- **Formatter**: Biome's formatter is **disabled** and the source is hand-wrapped. Never run a formatter over it.
 - **Pre-commit hooks** typecheck the whole project. Staging `mempg.ts` without matching `tests/` changes can fail.
 - **Bench scripts** (`bun run bench:*`): `mempg-shaped-consolidate` DROPs and recreates its scratch DB on whatever server `MEMPG_*` points to. Always set `MEMPG_*` explicitly.
 
