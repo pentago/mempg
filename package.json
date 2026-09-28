@@ -2,14 +2,17 @@
   "name": "@dzhi/mempg",
   "version": "0.1.0",
   "type": "module",
-  "description": "Postgres-backed persistent memory extension for oh-my-pi (omp)",
+  "description": "Persistent memory extension for oh-my-pi (omp), on Postgres + pgvector or SQLite",
   "scripts": {
     "check": "biome check .",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
+    "test:sqlite": "MEMPG_BACKEND=sqlite MEMPG_SQLITE_PATH=/tmp/mempg-sqlite-test.db bun test ./tests/sqlite.integration.ts",
     "bench:mempg-shaped-consolidate": "bun bench/mempg-shaped-consolidate.ts",
     "bench:embeddinggemma-calibration": "bun bench/embeddinggemma-calibration.ts",
-    "backfill": "bun deploy/backfill.ts"
+    "bench:backend-compare": "bun bench/backend-compare.ts",
+    "backfill": "bun deploy/backfill.ts",
+    "port:sqlite": "bun deploy/pg-to-sqlite.ts"
   },
   "exports": {
     ".": "./mempg.ts"

@@ -9,7 +9,7 @@ cp .env.example .env   # then fill in the values
 docker compose up -d
 ```
 
-That's it - on first boot the Postgres image creates the database named by `PG_DB`, and the `pg_trgm` extension plus the `memories` table (with full-text search indexes) are added by [`init/01-init.sh`](./init/01-init.sh).
+That's it - on first boot the Postgres image creates the database named by `PG_DB`, and the `memories` table (with full-text search indexes) is added by [`init/01-init.sh`](./init/01-init.sh).
 
 The compose file also includes an optional `ollama` service (the embedding backend for hybrid search). It starts with everything else but does nothing until you pull a model once:
 
@@ -25,36 +25,28 @@ CPU-only by default, which suffices - mempg's embeds are short and rare (~95ms w
 apply the newer columns by hand, once, on the database the plugin points at:
 
 ```sql
--- pg_trgm backs near-duplicate handling (memory_consolidate, injection collapse).
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-
 -- memory_type (plugin >= 0.14): defaulted, never required. Existing rows read
 -- as project_fact, which is what they were before the column existed.
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS memory_type text NOT NULL DEFAULT 'project_fact';
-ALTER TABLE memories DROP CONSTRAINT IF EXISTS memories_type_check;
-ALTER TABLE memories ADD CONSTRAINT memories_type_check
-  CHECK (memory_type IN ('preference', 'stack_fact', 'project_fact', 'episodic'));
 
 -- preference removed (plugin >= 0.15): AGENTS.md now covers the "applies
 -- everywhere" use case better than a relevance-ranked memory ever could.
--- Delete existing preference rows and tighten the constraint - do this only
--- once every preference-typed row has been reviewed (they're gone after).
+-- Review preference rows first - they're gone after this. episodic was never
+-- assigned by the plugin; it was global like stack_fact, so it maps there.
 DELETE FROM memories WHERE memory_type = 'preference';
+UPDATE memories SET memory_type = 'stack_fact' WHERE memory_type = 'episodic';
 ALTER TABLE memories DROP CONSTRAINT IF EXISTS memories_type_check;
 ALTER TABLE memories ADD CONSTRAINT memories_type_check
-  CHECK (memory_type IN ('stack_fact', 'project_fact', 'episodic'));
-
--- recall access ranking (plugin >= 0.14): incremented by memory_recall only;
--- the injection path stays read-only.
-ALTER TABLE memories ADD COLUMN IF NOT EXISTS access_count integer NOT NULL DEFAULT 0;
-ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_accessed_at timestamptz;
+  CHECK (memory_type IN ('stack_fact', 'project_fact'));
 
 -- memory_update bookkeeping (plugin >= 0.14).
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS updated_at timestamptz;
 
--- memory_consolidate (plugin >= 0.14): trigram content index for the
--- near-duplicate self-join.
-CREATE INDEX IF NOT EXISTS idx_memories_trgm ON memories USING gin (content gin_trgm_ops);
+-- No longer used: the recall access counters and the trigram index
+-- (near-duplicate detection runs in the plugin).
+ALTER TABLE memories DROP COLUMN IF EXISTS access_count, DROP COLUMN IF EXISTS last_accessed_at;
+DROP INDEX IF EXISTS idx_memories_trgm;
+DROP EXTENSION IF EXISTS pg_trgm;
 
 -- Hybrid retrieval: the embedding half of keyword+vector search. Requires the
 -- pgvector image (compose.yaml swapped postgres:18-alpine ->
@@ -67,11 +59,9 @@ CREATE EXTENSION IF NOT EXISTS vector;
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(768);
 CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);
 
--- Cross-session recall signal: which SESSIONS have independently recalled a
--- memory, not how many times (that's access_count, unused by ranking - see
--- mempg.ts's crossSessionBoost comment). The PRIMARY KEY makes repeated
--- recalls within one session count once, which is what makes this safe to
--- use as a small ranking tiebreak.
+-- Cross-session recall signal: which sessions have independently recalled a
+-- memory. The PRIMARY KEY makes repeated recalls within one session count
+-- once, which is what makes this safe to use as a small ranking tiebreak.
 CREATE TABLE IF NOT EXISTS memory_recalls (
   memory_id  integer NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
   session_id text NOT NULL,
@@ -168,3 +158,26 @@ export MEMPG_DB="mempg"
 ```
 
 Optional, for the embedding half of hybrid search: `MEMPG_OLLAMA_HOST` (default `localhost`), `MEMPG_OLLAMA_PORT` (default `11434`), `MEMPG_EMBED_MODEL` (default `embeddinggemma:300m`, 768 dimensions; a model with different output dimensions needs the `embedding` column re-created at that size plus a re-run of the backfill).
+
+## SQLite instead of Postgres
+
+With `MEMPG_BACKEND=sqlite` none of the above is needed: mempg keeps the same
+tables in one file (`MEMPG_SQLITE_PATH`, default `~/.omp/agent/mempg.sqlite`)
+and creates the schema itself on first use - keyword search through an FTS5
+index, embeddings as float32 blobs compared in the plugin. Ollama stays
+optional, exactly as with Postgres. The file works for every omp process on
+one machine (WAL mode); it is not a server other machines can share.
+
+Moving existing memories from Postgres (apply the upgrade block above first:
+the SQLite schema rejects the retired `episodic` type):
+
+```bash
+# MEMPG_* still point at the Postgres to copy from; it is only read.
+MEMPG_BACKEND=sqlite MEMPG_SQLITE_PATH="$HOME/.omp/agent/mempg.sqlite" bun run port:sqlite
+```
+
+It copies every memory with its id, tags, timestamps, supersede link and
+embedding, plus the cross-session recall records, from one consistent
+snapshot, then reads everything back and compares it field by field. The
+target file must hold no memories yet. `bun run backfill` also works with
+`MEMPG_BACKEND=sqlite`, for rows written while Ollama was down.

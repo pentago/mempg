@@ -302,7 +302,7 @@ CREATE TABLE memories (
   created_at    timestamptz DEFAULT now(),
   memory_type   text        NOT NULL DEFAULT 'project_fact',
   embedding     vector(${DIMS}),
-  CONSTRAINT memories_type_check CHECK (memory_type IN ('stack_fact', 'project_fact', 'episodic'))
+  CONSTRAINT memories_type_check CHECK (memory_type IN ('stack_fact', 'project_fact'))
 );
 CREATE INDEX idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);
 
@@ -368,12 +368,10 @@ try {
   console.log(`Embedded ${embedded}/${allRows.length} rows (${failedBatches} batches failed - Ollama unavailable for those).`);
 
   // Negative control - this content is synthetic and infra-flavored, but
-  // never matches the three fixed sentence shapes isTemplatedAutoLog
+  // never matches the three fixed sentence shapes isTemplatedContent
   // targets (mempg's own auto-generated logs).
-  const [{ n: templated }] = (await db`
-    SELECT count(*)::int AS n FROM memories WHERE ${__internals.isTemplatedAutoLog(db)}
-  `) as { n: number }[];
-  console.log(`\nExclusion filter (isTemplatedAutoLog) fired on ${templated}/${allRows.length} rows (expected: 0).`);
+  const templated = allRows.filter((r) => __internals.isTemplatedContent(r.content)).length;
+  console.log(`\nExclusion filter (isTemplatedContent) fired on ${templated}/${allRows.length} rows (expected: 0).`);
 
   const scored = (await db`
     SELECT g.is_duplicate, g.category, (1 - (m1.embedding <=> m2.embedding))::float8 AS cosine, m1.content AS c1, m2.content AS c2
