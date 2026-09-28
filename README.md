@@ -1,446 +1,138 @@
 # mempg
 
-Postgres-backed persistent memory for [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`).
+Long-term memory for [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) agents, stored in your own Postgres.
 
-## In simple terms
+## What it does
 
-Your omp agent normally forgets everything the moment a session
-ends. mempg fixes that: it gives the agent a real memory that survives
-across sessions and across projects, stored in your own Postgres
-database.
+An omp agent normally forgets everything when a session ends. mempg gives it a memory that lasts.
 
-**What it's good at:**
+- **Saves what matters.** Say "remember that we use jose, not jsonwebtoken" and it is stored word for word. The agent also saves things it learns on its own.
+- **Brings it back when relevant.** Before each reply, the memories that match your prompt are handed to the agent. Search understands meaning, so "API rate limit" finds a note about "requests per minute".
+- **Keeps projects apart.** Facts about one project stay in that project. Facts about your tools in general are shared everywhere.
+- **Handles corrections.** A new memory can replace an old one, so outdated facts stop showing up.
+- **Never gets in the way.** If the database or the search model is down, the agent keeps working without memory.
+- **Runs on infrastructure you control.** Your Postgres and your Ollama model, local or remote. No third-party service or API key.
 
-- **It remembers on its own.** Say "remember that we use jose, not
-  jsonwebtoken" and it's stored, word for word, with no extra step. The
-  agent can also choose to save things itself when it decides something
-  is worth keeping.
-- **It finds things even if you don't ask the same way twice.** Search
-  works both by keyword and by meaning, so asking about "the API rate
-  limit" still finds a memory that only says "requests per minute" - you
-  don't have to remember your own wording.
-- **It keeps project knowledge separate from general knowledge**,
-  automatically. A fact about *this specific customer's setup* stays out
-  of every other project. A fact about *your tooling in general* is
-  available everywhere. You don't have to manage folders or configure
-  this - the agent picks the right one when it saves something, and you
-  can correct it if it gets it wrong.
-- **It corrects itself properly.** When something changes, the old
-  memory doesn't just sit there contradicting the new one - it's marked
-  as replaced and stops showing up, while still being there if you ever
-  want to check the history.
-- **It never gets in the way.** If the database or the search engine is
-  slow or offline, the agent just keeps working with whatever it already
-  has - memory is a helpful extra, never something that can break or
-  stall a request.
-- **Nothing disappears by accident.** Cleaning up duplicate memories is
-  something you trigger on demand, you can preview exactly what would be
-  removed before committing to it, and it always shows you exactly what
-  it removed before it's gone for good.
-- **It's yours.** Everything runs on your own Postgres database and your
-  own local embedding model (via Ollama) - no data leaves your machine,
-  no cloud service, no API key required.
+## Quick start
 
-If you only read one more section, read "Using it well" below - a
-handful of habits that make the difference between a memory system that
-quietly helps and one that quietly fills up with noise.
+1. **Get a database.** Postgres with the `pg_trgm` and `vector` extensions. [`deploy/`](./deploy) has a ready Docker Compose setup, with an optional Ollama service for search by meaning. See [`deploy/README.md`](./deploy/README.md).
+2. **Install the plugin:**
 
----
+   ```bash
+   omp plugin install @dzhi/mempg
+   ```
 
-## Technical overview
+   Or try it from a checkout for one run: `omp -e ./mempg.ts`.
+3. **Point it at the database** with environment variables:
 
-Every memory is a row in one Postgres `memories` table. Four things
-happen around it:
+   ```bash
+   export MEMPG_HOST=localhost MEMPG_USER=mempguser MEMPG_DB=mempg
+   export MEMPG_PASSWORD=your-password
+   ```
 
-**1. Memories get in**
-- The agent calls `memory_remember` when it decides something is worth
-  keeping.
-- You say "remember that…", "don't forget…", or "keep in mind…" in a
-  prompt, and the text after the phrase, up to the first blank line, is
-  stored verbatim. This is a fixed regex, not a model call - deterministic
-  and auditable. Questions ("remember when X broke?"), triggers inside
-  code, and payloads over 700 characters are deliberately skipped.
-- After a busy turn (8+ tool calls) that stored nothing, mempg asks the
-  agent once to save anything worth keeping before it finishes.
-- On write, the row is embedded (`embeddinggemma:300m` via Ollama)
-  fire-and-forget, so a slow or dead embedder never delays the write
-  confirmation.
+Keep omp's built-in `memory.backend` set to `off`, otherwise you get two memory blocks.
 
-**2. Memories come back - automatically, ranked by relevance to what you
-just asked.**
-Before each agent run (subagents included), mempg takes that run's
-prompt and runs two searches at once:
-- **Keyword search** - your prompt becomes an OR-of-stemmed-words
-  Postgres full-text query.
-- **Embedding search** - the same prompt is embedded and compared by
-  cosine similarity (pgvector HNSW).
+### Settings
 
-The two ranked lists merge: the vector list's **top 2 rows are reserved
-unconditionally**, and the rest is filled by reciprocal rank fusion (RRF,
-k=60). This is why phrasing something differently than you originally
-stored it still finds the memory - the keyword half alone can't do that.
-Near-duplicates are collapsed out, the top 5 survive, and they're
-injected into the system prompt as a `<persistent-project-memory>`
-block, which stays in force for that run's tool-call continuations.
+All settings are environment variables. There are no plugin options.
 
-If Ollama is unreachable, the vector half is skipped and search silently
-degrades to keyword-only. If the database is unreachable, injection is
-skipped entirely. Neither ever blocks or fails a model request - the
-injection query has a hard 1s deadline.
+| Variable            | Default               | Notes                                                                 |
+| ------------------- | --------------------- | --------------------------------------------------------------------- |
+| `MEMPG_HOST`        | `localhost`           |                                                                       |
+| `MEMPG_PORT`        | `5432`                |                                                                       |
+| `MEMPG_USER`        | `mempguser`           |                                                                       |
+| `MEMPG_PASSWORD`    | empty                 |                                                                       |
+| `MEMPG_DB`          | `mempg`               |                                                                       |
+| `MEMPG_SSL`         | `disable`             | `disable`, `prefer`, `require`, `verify-ca`, `verify-full`            |
+| `MEMPG_INJECTION`   | `relevance`           | `recency` injects the newest memories instead of the best matches     |
+| `MEMPG_OLLAMA_HOST` | `localhost`           |                                                                       |
+| `MEMPG_OLLAMA_PORT` | `11434`               |                                                                       |
+| `MEMPG_EMBED_MODEL` | `embeddinggemma:300m` | A different model needs a matching column size (see `deploy/README.md`) |
 
-**3. Duplicates get cleaned up - on demand, never automatically.**
-Writes are never rejected. `memory_consolidate` is the cleanup tool, and
-you (or the agent) run it when you want. It makes two passes - trigram
-wording similarity, then embedding meaning similarity - keeps the newest
-of each duplicate group, and **returns the text of everything it
-deleted** so nothing is lost silently.
+**If the database is not on your machine, set `MEMPG_SSL=require` or stricter.** Otherwise the login crosses the network unencrypted.
 
-**4. Corrections replace, not just add.**
-Call `memory_remember` with `supersedes: <id>` when a new memory corrects
-or reverses an older one. The old memory is marked as superseded (not
-deleted) and stops showing up in recall or injection, so a correction
-can't end up sitting next to the outdated fact it was meant to replace.
-`memory_recall` with `includeSuperseded: true` brings it back into view,
-noting what replaced it.
+Errors and fallbacks go to the omp log in `~/.omp/logs/`, never to your terminal.
 
-### Scoping: the one concept worth understanding
+## Using it well
 
-Every memory has a **type**, and the type decides who can see it:
-
-- `stack_fact` - about your tooling, portable across every project using
-  the same stack ("our Terraform RDS module needs `ignore_changes`").
-  Visible everywhere.
-- `project_fact` (the default) - true about this specific
-  project/customer only ("customer A's staging DNS is flaky"). Visible
-  **only from its origin project**.
-
-The test when storing something: *would this help in a different
-customer's repo using the same tools?* Yes → `stack_fact`. No →
-`project_fact`.
-
-### Using it well
-
-- **Let the agent store things, but say "remember that…" when it
-  matters.** The keyword trigger is a guarantee; the agent's own
-  judgment is not.
-- **Get the type right.** A `project_fact` that should have been a
-  `stack_fact` is invisible in every other project - that's the most
-  common way a useful memory goes missing.
-- **Run `memory_consolidate` occasionally**, not constantly. It's cheap
-  and it shows you what it removed before you lose anything.
-- **Phrase recall queries naturally.** Hybrid search means you don't
-  have to remember your original wording - meaning-based matching covers
-  the gap.
-- **Keep memories self-contained.** "Use jose, not jsonwebtoken, for
-  Edge compatibility" survives out of context; "we decided on the second
-  option" does not.
-- **Use `supersedes` when you correct something**, not a second
-  unrelated memory. Two memories that disagree with no link between them
-  is exactly the situation `supersedes` exists to avoid.
+- **Say "remember that…" when it matters.** That always saves. Whether the agent saves something on its own is up to its judgment.
+- **Check the type.** A general tooling fact saved as a project fact is invisible in every other project. This is the most common way a useful memory goes missing.
+- **Keep memories self-contained.** "Use jose, not jsonwebtoken, for Edge compatibility" makes sense on its own. "We picked the second option" does not.
+- **Replace, don't pile up.** When a fact changes, save the new one with `supersedes` pointing at the old one.
+- **Clean up now and then.** Run `memory_consolidate` with `dryRun: true` to preview, then run it for real.
 
 ---
 
-Uses the `memories` table (`content`, `tags`, `session_id`, `project`,
-`created_at`, `search_vector`, `embedding`, `memory_type`,
-`access_count`, `last_accessed_at`, `updated_at`, `superseded_by`) plus a
-`memory_recalls` table (which sessions have recalled a memory, feeding a
-small ranking tiebreak) and the `pg_trgm` + `vector` extensions, and
-exposes `memory_recall` / `memory_remember` / `memory_forget` /
-`memory_update` / `memory_consolidate` / `memory_tags` / `memory_retag`
-tools.
+## How it works
 
-## Install
+Every memory is a row in one Postgres table, `memories`.
 
-As an omp plugin (the package declares its extension in
-`package.json#omp.extensions`):
+### Memory types
 
-```bash
-omp plugin install @dzhi/mempg
-```
+The type decides where a memory is visible:
 
-Or load it for a single run from a checkout:
+| Type                     | Visible             | Use for                                                                  |
+| ------------------------ | ------------------- | ------------------------------------------------------------------------ |
+| `project_fact` (default) | Its own project only | Facts about this project or customer ("customer A's staging DNS is flaky") |
+| `stack_fact`             | Everywhere          | Facts about your tools ("our Terraform RDS module needs `ignore_changes`") |
+| `episodic`               | Everywhere          | Reserved for a future feature; nothing sets it automatically              |
 
-```bash
-omp -e ./mempg.ts
-```
+A rule of thumb: would this help in another customer's repo that uses the same tools? Yes means `stack_fact`.
 
-Leave omp's built-in `memory.backend` at `off` - mempg is a separate
-extension, and running both injects two memory blocks.
+The same boundary applies to changes. A project can't edit, delete or retag another project's `project_fact`; the call fails and names the owning project. `memory_recall` and `memory_tags` take `global: true` to also read other projects' `project_fact` memories.
 
-## Connecting to the database
+### How memories get saved
 
-Need a Postgres instance? The [`deploy/`](./deploy) directory ships a
-hardened Docker Compose setup (localhost-only, `memories` schema
-auto-created on first boot, plus an optional Ollama service as the
-embedding backend) - see [`deploy/README.md`](./deploy/README.md).
+- **The agent** calls `memory_remember`.
+- **You** write "remember that…", "don't forget…" or "keep in mind…". A fixed pattern, not a model, stores the text after the phrase, up to the first blank line. Questions ("remember when X broke?"), phrases inside code, and long pasted texts are skipped.
+- **A checkpoint** runs after a busy turn in which nothing was saved: the agent gets one hidden follow-up asking it to store anything worth keeping.
 
-Configure the connection via shell environment variables:
+Each new memory is embedded in the background with Ollama. If Ollama is down, the memory is still saved, and only keyword search finds it until `bun run backfill` embeds it.
 
-```bash
-export MEMPG_HOST="localhost"
-export MEMPG_PORT="5432"
-export MEMPG_USER="mempguser"
-export MEMPG_PASSWORD="your-postgres-password"
-export MEMPG_DB="mempg"
-export MEMPG_SSL="disable"
-```
+Limits: 10-4000 characters and up to 10 tags. Too-large writes are rejected, not truncated. Long memories get a warning, because only the start of each one is shown to the agent.
 
-| Env var            | Default              |
-| ------------------ | -------------------- |
-| `MEMPG_HOST`         | `localhost`           |
-| `MEMPG_PORT`         | `5432`                |
-| `MEMPG_USER`         | `mempguser`             |
-| `MEMPG_DB`           | `mempg`                 |
-| `MEMPG_SSL`          | `disable`              |
-| `MEMPG_INJECTION`    | `relevance`             |
-| `MEMPG_OLLAMA_HOST`  | `localhost`              |
-| `MEMPG_OLLAMA_PORT`  | `11434`                   |
-| `MEMPG_EMBED_MODEL`  | `embeddinggemma:300m`      |
+### How memories come back
 
-`MEMPG_SSL` accepts `disable`, `prefer`, `require`, `verify-ca`, or
-`verify-full` (anything else falls back to `disable`). It defaults to
-`disable` for the usual localhost setup - **set it to `require` or
-stricter whenever `MEMPG_HOST` is not local**, otherwise the password
-handshake crosses the network in plaintext.
+Before each agent run, mempg searches with your prompt by keyword (Postgres full-text) and by meaning (pgvector embeddings), and merges the results. Near-duplicates are dropped, and the top 5 go into the system prompt, each shortened and labelled with its project. If nothing matches, the newest memories are used instead.
 
-There are no plugin options - configuration is env-only. Diagnostics
-(connection failures, embedding fallbacks) go to the omp log under
-`~/.omp/logs/`, never to the terminal.
+When something fails, it degrades instead of blocking: with Ollama down it searches by keyword only, and with the database down or slow (1-second deadline) the agent simply gets no memories.
 
-## How memory works
+### Tools
 
-Visibility is **type-based**:
+| Tool                 | What it does                                                          |
+| -------------------- | --------------------------------------------------------------------- |
+| `memory_remember`    | Store a memory; optional `type`, `tags`, `supersedes`                 |
+| `memory_recall`      | Search by keyword and meaning; empty query lists the newest           |
+| `memory_update`      | Rewrite a memory, keeping its original date                           |
+| `memory_forget`      | Delete a memory by id                                                 |
+| `memory_consolidate` | Remove duplicates, on demand only                                     |
+| `memory_tags`        | List tags in use, with counts                                         |
+| `memory_retag`       | Rename a tag everywhere you're allowed to                             |
 
-| Type           | Visibility                          | What it's for                                                                                                                                             |
-| -------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `stack_fact`   | Global                                | True about the tooling/stack itself - portable to any project using the same stack (a Terraform module quirk, a Helm convention)                          |
-| `project_fact` | Origin project only (default)          | True about this specific project/customer only; pass `global: true` on `memory_recall` to reach across projects                                          |
-| `episodic`     | Global (same rule as `stack_fact`)      | Reserved for a future feature; nothing writes it automatically today, but a manual `memory_remember` with this type stores and is visible everywhere, same as `stack_fact` |
+### Corrections (`supersedes`)
 
-`memory_forget` / `memory_update` follow the same rule: a foreign
-project's `project_fact` is off-limits (the call fails and names the
-owning project); the global type (`stack_fact`) is maintainable from any
-project.
+`memory_remember` with `supersedes: <id>` saves the new memory and marks the old one as replaced, in one transaction. If the old one can't be marked, for example because it belongs to another project, nothing is saved.
 
-`access_count` and `last_accessed_at` are updated on every
-`memory_recall` read but nothing currently ranks by them - they're
-collected as data for possible future use, not consumed by any ranking
-today. (An access-frequency ranking was tried and reverted: bumping
-exactly the returned top-5 created a rich-get-richer loop where a few
-rows pinned the top slot after a handful of runs.)
+A replaced memory is hidden from recall, injection and cleanup, but not deleted. `memory_recall` with `includeSuperseded: true` shows it and what replaced it. Deleting the newer memory makes the old one current again.
 
-`memory_recall` also records which session did the recalling in a
-separate `memory_recalls` table - a memory recalled from several
-distinct sessions gets a small ranking tiebreak (capped, weighed well
-below the same-project boost). Recalling it many times from the *same*
-session doesn't compound the count, which is the deliberate difference
-from `access_count`'s reverted attempt above.
+### Duplicate cleanup
 
-## How injection picks memories
+Writes are never rejected as duplicates. `memory_consolidate` cleans up when you run it. It finds duplicates by similar wording and by similar meaning, keeps the newest memory of each group, deletes the rest, and returns the deleted texts so you can merge in anything unique.
 
-By default the block is **relevance-ranked, not recency-ranked**: the
-user's latest prompt is turned into a full-text query (OR of stemmed
-words) over every **visible** memory (global types from anywhere,
-`project_fact` from its origin project), ranked by relevance with a
-small same-project tiebreak, top 5 injected - each line labeled with its
-origin project. When neither search half matches the prompt, it falls
-back to the latest visible memories, newest first. Near-duplicate
-memories (>=80% trigram content similarity) are collapsed out of this
-block automatically before the top 5 are chosen, so five near-identical
-restatements of one fact won't crowd out everything else. Injected
-content is truncated to 600 characters per memory. The block is injected
-even when no memory matches or is visible yet (`Memories: none visible here yet.`),
-because its write/recall guidance matters most before the first memory is
-written.
+A pair that matches by meaning but differs in a number, path or name (a rate limit of 100 vs 500) is flagged `[meaning-uncertain]` instead. Nothing is deleted; review it yourself.
 
-Set `MEMPG_INJECTION=recency` to restore the old blind-last-5 behavior
-instead: no prompt-matching, just the most recent visible memories.
-
-Retrieval is **hybrid**: the prompt runs through keyword full-text
-search and, when Ollama is reachable, through embedding search
-(`embeddinggemma:300m`, pgvector HNSW, cosine) - the two ranked lists
-merge with 2 reserved embedding slots plus reciprocal rank fusion (k=60)
-for the rest, so exact-word hits and said-differently paraphrase hits
-both surface. Writes are embedded
-fire-and-forget; rows from before this feature carry no embedding until
-`bun run backfill` fills them (see
-[`deploy/README.md`](./deploy/README.md)).
-
-If Ollama is unreachable - or the database predates the embedding column
-- search silently degrades to keyword-only; nothing breaks. A cold model
-load is over the 1s injection deadline, so the plugin warms the model at
-session start and pins it with `keep_alive`; a warm embed runs
-concurrently with the keyword query, well inside the query budget.
-
-## Tools
-
-Seven agent tools are registered: `memory_remember` (store),
-`memory_recall` (search), `memory_forget` (delete by id), `memory_update`
-(rewrite an existing memory, keeping its original learned date),
-`memory_consolidate` (remove near-duplicates on demand),
-`memory_tags` (list tags currently in use, with counts, to reuse an
-existing tag instead of minting a near-duplicate), and `memory_retag`
-(rename a tag across every memory that has it, once `memory_tags` shows
-two variants of the same tag exist). The agent reads their usage rules
-from the tool schemas - as the user, the things worth knowing are:
-
-- Visibility follows the type (see the table above); `memory_recall`
-  takes `global: true` to also search other projects' `project_fact`
-  memories (`stack_fact` is always searched regardless of this flag).
-  `memory_tags` takes the same flag, plus `limit` (default 200).
-  `memory_retag` follows the same project-boundary rule as
-  `memory_forget`/`memory_update` (no `global` flag - a rename's reach
-  is whatever it's already allowed to touch, not something to opt into
-  widening).
-- Duplicate writes are **never rejected** - `memory_remember` is a plain
-  store. Near-duplicates are collapsed out of the injected block
-  automatically, and `memory_consolidate` cleans them up when you ask.
-- `memory_remember` takes an optional `supersedes: <id>` to mark an
-  earlier memory as replaced rather than just narrating the change in
-  prose - see "Supersede tracking" below.
-
-Writes are capped at 4000 characters of content, 10 tags, and 64
-characters per tag; oversized writes are rejected with the actual size
-rather than silently truncated. A write over 700 characters still
-succeeds, but the response includes a note that most of it won't fit in
-the 600-character injected block - a nudge to keep entries short, not a
-rejection. Memories carry a `type` (`stack_fact`, `project_fact` default,
-or `episodic` - see the visibility table above).
-
-### Automatic capture
-
-Saying "remember this/that", "remember to ...", "don't forget ...", or
-"keep in mind ..." in a prompt stores the text following the phrase
-verbatim, tagged `user-requested` - matched by a fixed pattern, not an
-LLM call, so it's deterministic and auditable. Questions using the
-trigger phrase ("remember when the pool broke?") are deliberately not
-captured, since they're asking about the past, not asking to store
-something new - only imperative uses ("remember that when X happens, do
-Y") trigger it.
-
-The captured text stops at the first blank line, so a request followed
-by other instructions stores only the request. Triggers that are really
-code are ignored: inside a `` `code span` `` or fenced block, glued to
-`.`/`/`/`` ` ``, or followed by `(` - a pasted spec mentioning
-`` `remember()` `` once got stored as a 3,000-character memory. A payload
-over 700 characters is skipped rather than truncated, because a real
-"remember that X" is a sentence, not a document. When a trigger is
-skipped, the model can still call `memory_remember` itself.
-
-This runs alongside the model's own judgment to call `memory_remember` -
-it doesn't replace it, it's a safety net for the cases where you
-explicitly signal "this matters" and want it captured regardless of
-whether the model separately decides to store it.
-
-### End-of-turn checkpoint
-
-Prompt text alone doesn't reliably get models to write memory, so mempg
-adds one deterministic nudge through omp's `session_stop` hook. When a
-main-session turn is about to finish after **8 or more tool calls**,
-none of which was `memory_remember`/`memory_update`, and the prompt itself
-wasn't keyword-captured, the agent gets one hidden continuation. It asks
-the agent to store any correction, gotcha, hard-won fix, or environment
-fact from the turn, or to reply "No new memories." The gate is counted,
-not model-judged. It fires at most once per turn (never inside its own
-continuation) and never for subagents. The cost is one extra model turn
-on busy turns that stored nothing.
-
-### Duplicates
-
-Writes are never rejected for duplicates - cleanup is
-`memory_consolidate`'s job, run on demand. Pass `dryRun: true` to preview
-exactly what a real run would remove, without deleting anything - review
-the output, then call again without `dryRun` to commit. (The preview
-reflects the corpus at that moment; if memories are added in between, a
-follow-up real call re-evaluates independently and may not match
-exactly.) It runs two passes and reports which one found each removed
-group:
-
-- **`[wording]`** - trigram content similarity (>=80%): catches
-  restatements that share most of their wording (the old
-  FTS-on-first-60-chars rule missed 28 such pairs on the real corpus).
-- **`[meaning]`** - embedding cosine similarity
-  (`embeddinggemma:300m`, >=0.83): catches the same fact stated in
-  completely different words, which trigram similarity structurally
-  cannot reach. Only memories that have an embedding participate, and
-  templated auto-generated content (background-task status logs,
-  session-compaction summaries, per-app checklist entries) is excluded -
-  real-corpus testing found that boilerplate sentence shapes drive
-  cosine similarity high between genuinely different facts (different
-  task IDs, sessions, apps).
-- **`[meaning-uncertain]`** - a pair that matched by meaning, but with a
-  specific number, path, or name that differs between them (a rate limit
-  of 100 vs 500; two different file paths). Close enough to look like a
-  duplicate, different enough that deleting either side could lose a
-  real fact - so neither is touched. Review the pair yourself and use
-  `memory_update` if it turns out to be the same fact after all.
-
-Both passes (`[wording]`, `[meaning]`) keep the newest of every group and
-delete the rest (capped at 25 groups per pass per run), returning the
-removed texts so the agent can merge back any unique detail with
-`memory_update`. `[meaning-uncertain]` pairs are the exception - nothing
-is deleted, they're only reported. Both passes refuse to cluster across
-a project boundary that `memory_forget`/`memory_update` already won't
-cross. Near-duplicates are also collapsed out of the
-injected block automatically between consolidations. The wording pass
-needs the trgm index; fresh installs from [`deploy/`](./deploy) get it
-automatically, existing databases run the upgrade block in
-[`deploy/README.md`](./deploy/README.md). The meaning pass needs the
-`embedding` column populated - rows Ollama never reached simply aren't
-candidates for it.
-
-The 0.83 meaning-similarity threshold was calibrated and independently
-re-verified against two different embedding models (the original
-`bge-m3` and the current `embeddinggemma:300m`) - both land on the same
-value, and `embeddinggemma:300m` actually shows a cleaner separation
-between duplicates and distinct pairs than `bge-m3` did.
-
-If the database is unreachable, memory injection is skipped and the
-tools return a generic error - a slow or dead database never blocks a
-model request.
-
-### Supersede tracking
-
-A correction or a reverted decision used to leave the OLD memory in
-place, discoverable by recall/injection exactly like a current fact -
-the only signal it was reverted was a *later*, unrelated memory
-narrating the change in prose, which recall/injection have no reason to
-always return together. `memory_remember` now takes an optional
-`supersedes: <id>`: the new memory is inserted and the old one is marked
-`superseded_by` in a single transaction (either both happen or neither
-does - a rejected supersede, e.g. across a project boundary, rolls back
-the whole write). A superseded memory is excluded from `memory_recall`
-and injection by default - it is not deleted, just no longer treated as
-current - and stays visible with `memory_recall`'s `includeSuperseded:
-true`, annotated with what replaced it. `memory_consolidate` also skips
-superseded rows entirely on both passes: they are already a resolved,
-explicit decision, not an accidental duplicate to guess about. Forgetting
-the *newer* memory un-supersedes the old one (`ON DELETE SET NULL`)
-rather than leaving a dangling reference; forgetting or updating the
-superseded memory itself works as normal, since ownership checks are
-separate from "is this current".
+`dryRun: true` previews a run without deleting. Cleanup respects the same project boundary as edits: a `project_fact` is only ever grouped with memories from its own project.
 
 ## Development
 
 ```bash
 bun install
-bun run check      # biome lint
+bun run check      # lint (Biome)
 bun run typecheck  # tsc --noEmit
-bun test           # integration suite, needs a live Postgres with pg_trgm
+bun test           # integration tests, need Postgres with pg_trgm + vector
+pre-commit install && pre-commit install --hook-type pre-push
 ```
 
-Enable the commit hooks once per clone
-([pre-commit](https://pre-commit.com)):
+The hooks run lint and typecheck on commit, and check that a pushed tag matches the `package.json` version. `bun test` writes to the database it's pointed at, so use a throwaway one. CI runs it against a fresh Postgres container.
 
-```bash
-pre-commit install
-```
-
-It runs lint and typecheck on commits that touch `.ts` files. `bun test`
-is left out of the hook because it writes to a real database - CI runs
-it against a throwaway Postgres service container instead.
-
-There are also consolidate benchmarks (`bench/`) that measure the
-meaning pass's threshold and detail cross-check - see
-[`bench/README.md`](./bench/README.md) if you're changing the embedding
-model or `detailConflicts`.
+Upgrading an existing database: see [`deploy/README.md`](./deploy/README.md#upgrading-an-existing-install). Threshold benchmarks for cleanup live in [`bench/`](./bench/README.md).
