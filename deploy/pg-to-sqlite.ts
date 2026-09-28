@@ -5,7 +5,7 @@
 // text stay valid. Postgres is only read; the SQLite file must have no
 // memories yet (it is created with the schema if missing):
 //
-//   MEMPG_BACKEND=sqlite MEMPG_SQLITE_PATH=$HOME/.omp/agent/mempg.sqlite bun run port:sqlite
+//   MEMPG_BACKEND=sqlite MEMPG_SQLITE_PATH=$HOME/.omp/agent/mempg.db bun run port:sqlite
 import { SQL } from "bun";
 import mempg from "../mempg.ts";
 
