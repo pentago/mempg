@@ -17,7 +17,7 @@ An omp agent normally forgets everything when a session ends. mempg gives it a m
 
 1. **Get a database.** Postgres with the `vector` extension. [`deploy/`](./deploy) has a ready Docker Compose setup, with an optional Ollama service for search by meaning. See [`deploy/README.md`](./deploy/README.md).
 
-   **Or skip the server:** set `MEMPG_BACKEND=sqlite` and mempg keeps everything in one file, `~/.omp/agent/mempg.sqlite`, created on first use. Moving existing memories over: `bun run port:sqlite` (see [`deploy/README.md`](./deploy/README.md#sqlite-instead-of-postgres)).
+   **Or skip the server:** set `MEMPG_BACKEND=sqlite` and mempg keeps everything in one file, `~/.omp/agent/mempg.db`, created on first use. Moving existing memories over: `bun run port:sqlite` (see [`deploy/README.md`](./deploy/README.md#sqlite-instead-of-postgres)).
 2. **Install the plugin:**
 
    ```bash
@@ -41,7 +41,7 @@ All settings are environment variables. There are no plugin options.
 | Variable            | Default               | Notes                                                                 |
 | ------------------- | --------------------- | --------------------------------------------------------------------- |
 | `MEMPG_BACKEND`     | `pgvector`            | `sqlite` stores memories in a local file instead of Postgres          |
-| `MEMPG_SQLITE_PATH` | `~/.omp/agent/mempg.sqlite` | SQLite only; the directory must exist                           |
+| `MEMPG_SQLITE_PATH` | `~/.omp/agent/mempg.db` | SQLite only; the directory must exist                               |
 | `MEMPG_HOST`        | `localhost`           |                                                                       |
 | `MEMPG_PORT`        | `5432`                |                                                                       |
 | `MEMPG_USER`        | `mempguser`           |                                                                       |

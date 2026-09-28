@@ -162,7 +162,7 @@ Optional, for the embedding half of hybrid search: `MEMPG_OLLAMA_HOST` (default 
 ## SQLite instead of Postgres
 
 With `MEMPG_BACKEND=sqlite` none of the above is needed: mempg keeps the same
-tables in one file (`MEMPG_SQLITE_PATH`, default `~/.omp/agent/mempg.sqlite`)
+tables in one file (`MEMPG_SQLITE_PATH`, default `~/.omp/agent/mempg.db`)
 and creates the schema itself on first use - keyword search through an FTS5
 index, embeddings as float32 blobs compared in the plugin. Ollama stays
 optional, exactly as with Postgres. The file works for every omp process on
@@ -173,7 +173,7 @@ the SQLite schema rejects the retired `episodic` type):
 
 ```bash
 # MEMPG_* still point at the Postgres to copy from; it is only read.
-MEMPG_BACKEND=sqlite MEMPG_SQLITE_PATH="$HOME/.omp/agent/mempg.sqlite" bun run port:sqlite
+MEMPG_BACKEND=sqlite MEMPG_SQLITE_PATH="$HOME/.omp/agent/mempg.db" bun run port:sqlite
 ```
 
 It copies every memory with its id, tags, timestamps, supersede link and

@@ -69,7 +69,7 @@ function makeSql(cfg: DbConfig): SQL {
 // load like the rest of the config. SQLite keeps the same tables in one local
 // file (FTS5 for keywords, float32 blobs for embeddings), so no server is needed.
 const SQLITE = process.env.MEMPG_BACKEND === "sqlite";
-const SQLITE_PATH = process.env.MEMPG_SQLITE_PATH || `${process.env.HOME}/.omp/agent/mempg.sqlite`;
+const SQLITE_PATH = process.env.MEMPG_SQLITE_PATH || `${process.env.HOME}/.omp/agent/mempg.db`;
 
 const sql = SQLITE ? new SQL({ adapter: "sqlite", filename: SQLITE_PATH }) : makeSql(defaultConfig);
 
