@@ -941,10 +941,6 @@ function validateWrite(args: RememberArgs): string | null {
 // restatements collide.
 const DEDUP_SIMILARITY = 0.8;
 
-// Supersede check failure: rolls back the insert and returns a specific message
-// instead of toolError's generic one.
-class SupersedeError extends Error {}
-
 async function remember(
   args: RememberArgs,
   ctx: { directory: string; sessionID: string },
@@ -967,31 +963,37 @@ async function remember(
     const tags = args.tags ?? [];
     const basename = ctx.directory.split('/').pop() ?? ctx.directory;
 
-    // One transaction: an unreachable supersede target rolls back the insert.
-    const newId = await sql.begin(async (tx) => {
-      const [{ id }] = await tx`
-        INSERT INTO memories (content, tags, session_id, project, memory_type)
-        VALUES (${args.content}, ${tagsParam(tx, tags)}, ${ctx.sessionID}, ${ctx.directory}, ${args.type ?? "project_fact"})
+    // No transaction: Bun's SQLite adapter runs everything on one connection,
+    // where overlapping sql.begin calls fail and any query issued meanwhile
+    // joins (and rolls back with) the open transaction. Instead the insert
+    // itself checks the supersede target: an unreachable one saves nothing.
+    let [row] = await sql`
+      INSERT INTO memories (content, tags, session_id, project, memory_type)
+      SELECT ${args.content}, ${tagsParam(sql, tags)}, ${ctx.sessionID}, ${ctx.directory}, ${args.type ?? "project_fact"}
+      WHERE ${supersedesId === undefined} OR EXISTS (
+        SELECT 1 FROM memories WHERE id = ${supersedesId ?? null} AND ${visibleRows(sql, ctx.directory)}
+      )
+      RETURNING id
+    ` as ({ id: number } | undefined)[];
+    if (row && supersedesId !== undefined) {
+      const linked = await sql`
+        UPDATE memories SET superseded_by = ${row.id}
+        WHERE id = ${supersedesId} AND ${visibleRows(sql, ctx.directory)}
         RETURNING id
       ` as { id: number }[];
-      if (supersedesId === undefined) return id;
-
-      const linked = await tx`
-        UPDATE memories SET superseded_by = ${id}
-        WHERE id = ${supersedesId} AND ${visibleRows(tx, ctx.directory)}
-        RETURNING id
-      ` as { id: number }[];
+      // The target was forgotten or retyped between the two statements.
       if (linked.length === 0) {
-        const exists = await tx`SELECT project, memory_type FROM memories WHERE id = ${supersedesId}` as { project: string; memory_type: string }[];
-        if (exists.length > 0) {
-          throw new SupersedeError(
-            `memory #${supersedesId} is a ${exists[0].memory_type} belonging to ${exists[0].project}; cannot supersede it from here. Only that project's agent can mark it superseded.`,
-          );
-        }
-        throw new SupersedeError(`no memory #${supersedesId}; nothing to supersede.`);
+        await sql`DELETE FROM memories WHERE id = ${row.id}`;
+        row = undefined;
       }
-      return id;
-    });
+    }
+    if (!row) {
+      const exists = await sql`SELECT project, memory_type FROM memories WHERE id = ${supersedesId}` as { project: string; memory_type: string }[];
+      return exists.length > 0
+        ? `ERROR: memory #${supersedesId} is a ${exists[0].memory_type} belonging to ${exists[0].project}; cannot supersede it from here. Only that project's agent can mark it superseded.`
+        : `ERROR: no memory #${supersedesId}; nothing to supersede.`;
+    }
+    const newId = row.id;
 
     // Fire-and-forget: a failure leaves embedding NULL, keyword search keeps
     // working, and the backfill (deploy/backfill.ts) fills the gap later.
@@ -1001,7 +1003,6 @@ async function remember(
     invalidateInjection(ctx.directory);
     return `Stored memory #${newId} (project ${basename}).${lengthNudge(args.content)}`;
   } catch (e: unknown) {
-    if (e instanceof SupersedeError) return `ERROR: ${e.message}`;
     return toolError("remember", "remember", e);
   }
 }
