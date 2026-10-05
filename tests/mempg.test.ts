@@ -2157,6 +2157,55 @@ describe("omp extension", () => {
     }
   });
 
+  test("a git worktree checkout maps to its main repo root for capture and injection", async () => {
+    const main = `/tmp/mempg-test-omp-main-${Date.now()}`;
+    const worktree = `${main}__worktrees/wt`;
+    try {
+      // A worktree checkout's `.git` is a FILE naming the main repo's worktree
+      // dir - the one fact every worktree CLI produces, whatever it names paths.
+      await Bun.write(`${worktree}/.git`, `gitdir: ${main}/.git/worktrees/wt\n`);
+      const handler = beforeAgentStart(bind());
+      const captured = (await handler(
+        { type: "before_agent_start", prompt: "remember that the mempg worktree marker is HERON-6612", systemPrompt: [] },
+        ctxFor(worktree, "main"),
+      )) as { systemPrompt: string[] };
+      expect(captured.systemPrompt.join("\n")).toContain("<mempg-capture>");
+      await __internals.settleCaptures();
+      const rows = await __internals.sql`SELECT id FROM memories WHERE project = ${main} AND content LIKE ${"%HERON-6612%"}`;
+      expect(rows.length).toBe(1);
+      // Injection from the worktree must also see the main project's rows.
+      await __internals.remember(
+        { content: "mempg worktree injection marker LAPWING-4490 lives in the fixture.", type: "project_fact" },
+        { directory: main, sessionID: "s" },
+      );
+      __internals.invalidateInjection(main);
+      const injected = (await handler(
+        { type: "before_agent_start", prompt: "where does LAPWING-4490 live", systemPrompt: [] },
+        ctxFor(worktree, "main"),
+      )) as { systemPrompt: string[] };
+      expect(injected.systemPrompt.join("\n")).toContain("LAPWING-4490");
+      // Non-worktrees keep cwd: no `.git` file at all, and a submodule-style gitdir.
+      expect(await __internals.resolveProjectDir(projectDir)).toBe(projectDir);
+      const sub = `/tmp/mempg-test-omp-sub-${Date.now()}`;
+      await Bun.write(`${sub}/.git`, `gitdir: ${main}/.git/modules/sub\n`);
+      expect(await __internals.resolveProjectDir(sub)).toBe(sub);
+      // Relative gitdir (git 2.48 worktree.useRelativePaths): resolved against
+      // cwd, no ".." segments leak into the project key.
+      const rel = `${main}__worktrees/rel`;
+      await Bun.write(`${rel}/.git`, `gitdir: ../../${main.split("/").pop()}/.git/worktrees/rel\n`);
+      expect(await __internals.resolveProjectDir(rel)).toBe(main);
+      // A bare repo's worktree gitdir has no "/.git" to strip: the bare dir
+      // itself is the shared project, not its parent ("~/git").
+      const bare = `/tmp/mempg-test-omp-bare-${Date.now()}.git`;
+      const bareWt = `${bare}__worktrees/x`;
+      await Bun.write(`${bareWt}/.git`, `gitdir: ${bare}/worktrees/x\n`);
+      expect(await __internals.resolveProjectDir(bareWt)).toBe(bare);
+    } finally {
+      __internals.setLogSink();
+      await purge(main);
+    }
+  });
+
   test("tool schemas keep required, maxItems, enum and strictness through toZod", () => {
     const spec = __internals.TOOL_SPECS.find((t) => t.name === "memory_remember");
     if (!spec) throw new Error("memory_remember spec missing");

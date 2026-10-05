@@ -1,6 +1,6 @@
 {
   "name": "@dzhi/mempg",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Persistent memory extension for oh-my-pi (omp), on Postgres + pgvector or SQLite",
   "scripts": {

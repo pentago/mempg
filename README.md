@@ -8,7 +8,7 @@ An omp agent normally forgets everything when a session ends. mempg gives it a m
 
 - **Saves what matters.** Say "remember that we use jose, not jsonwebtoken" and it is stored word for word. The agent also saves things it learns on its own.
 - **Brings it back when relevant.** Before each reply, the memories that match your prompt are handed to the agent. Search understands meaning, so "API rate limit" finds a note about "requests per minute".
-- **Keeps projects apart.** Facts about one project stay in that project. Facts about your tools in general are shared everywhere.
+- **Keeps projects apart.** Facts about one project stay in that project. Facts about your tools in general are shared everywhere. Plugin is **worktree-aware** regardless of which tooling manages them.
 - **Handles corrections.** A new memory can replace an old one, so outdated facts stop showing up.
 - **Never gets in the way.** If the database or the search model is down, the agent keeps working without memory.
 - **Runs on infrastructure you control.** Your Postgres (or a SQLite file) and your Ollama model, local or remote. No third-party service or API key.
