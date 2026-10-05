@@ -26,7 +26,7 @@ mempg is a **single-file** oh-my-pi (omp) extension (`mempg.ts`). It gives agent
 - **Visibility**:
   - `visibleRows()` is the single project boundary: `stack_fact` is global, `project_fact` only from its origin project.
   - Reads (injection, recall, tags) also apply `notSuperseded()`. Only recall and tags accept `global: true` to widen reach; injection never does.
-  - Writes (forget, update, retag, the supersede link) are always bounded by `visibleRows()` and have no `global` opt-in. They skip `notSuperseded()`, so superseded rows stay fixable.
+  - Writes (retag and the supersede link) are always bounded by `visibleRows()`. `forget`/`update` are bounded by default but take `global: true` to override (matching recall's read opt-in), so a consolidate cleanup can finish from any directory; a global write clears the whole `injectionCache`. Writes skip `notSuperseded()`, so superseded rows stay fixable.
 - **Backends**: `SQLITE` (from `MEMPG_BACKEND`) is fixed at load; one `sql` client serves both, Bun's `SQL` with the sqlite adapter or a Postgres pool.
   - Dialect differences live in small builders in the `// --- Dialect ---` section (`dateCol`, `nowSql`, `tagsParam`, `idIn`, `vectorParam`, `ftsJoin`/`ftsMatch`, `keywordScore`, `nearest`), plus inline `SQLITE ?` branches for retag, tag listing, the recall-record insert and the consolidate meaning pass.
   - SQLite: tags are JSON text (`tagList()` reads either form), timestamps ISO-8601 UTC text, embeddings float32 blobs ranked in TS, keywords in the external-content `memories_fts` table kept by triggers. `SQLITE_SCHEMA` is its DDL, run by `ready()` on first use.
@@ -42,7 +42,7 @@ mempg is a **single-file** oh-my-pi (omp) extension (`mempg.ts`). It gives agent
   2. **Meaning**: embedding cosine, computed in SQL on Postgres (boundary: `mutuallyVisible()`, prefilter: `isTemplatedAutoLogPair`) and in TS on SQLite (`mutuallyVisibleRows()`). Both backends drop templated auto-logs with `isTemplatedContent()`.
   - The meaning pass excludes the wording pass's removals in both real and `dryRun` mode, so a preview matches a real run on the same snapshot.
   - `detailConflicts` routes a pair with a conflicting number, path or proper noun to `[meaning-uncertain]` instead of deleting it.
-- **Cache invalidation is asymmetric**: remember, forget and update clear only the caller's directory. `retag` and a real `consolidate` clear the whole `injectionCache`.
+- **Cache invalidation is asymmetric**: remember, forget and update clear only the caller's directory — except a `global: true` forget/update, which can touch any project's row and clears the whole `injectionCache`. `retag` and a real `consolidate` also clear the whole `injectionCache`.
 
 ## Key Directories
 
