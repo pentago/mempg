@@ -1,5 +1,6 @@
 // mempg - persistent memory extension for oh-my-pi (omp), on Postgres + pgvector
 // (default) or a local SQLite file (MEMPG_BACKEND=sqlite).
+import { resolve } from "node:path";
 import { SQL } from "bun";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { ZodLikeSchema } from "@oh-my-pi/omptype/zod";
@@ -1866,6 +1867,36 @@ async function settleCaptures(): Promise<void> {
   await Promise.all(inflightCaptures);
 }
 
+// --- Project identity: every git worktree checkout, whatever CLI created it,
+// holds a `.git` FILE whose "gitdir:" line points at the main repo's
+// `.git/worktrees/<name>`. Memories then land under the main repo root, not
+// one project per checkout. Plain repos, submodules and non-repos keep cwd. ---
+
+const projectDirCache = new Map<string, string>();
+
+async function resolveProjectDir(cwd: string): Promise<string> {
+  const cached = projectDirCache.get(cwd);
+  if (cached !== undefined) return cached;
+  let dir = cwd;
+  try {
+    // gitdir may be relative (git 2.48 worktree.useRelativePaths), and "../"
+    // segments must not leak into the project key: resolve() against cwd first.
+    const raw = /^gitdir: (.+)$/.exec((await Bun.file(`${cwd}/.git`).text()).trim())?.[1];
+    if (raw) {
+      const gitdir = resolve(cwd, raw);
+      // <main>/.git/worktrees/<name> -> <main>; a bare repo's worktrees map to
+      // the bare dir itself (only a literal "/.git" suffix is stripped, so
+      // "<bare>.git" survives), which still gives them one shared project.
+      const wt = /\/worktrees\/[^/]+$/.exec(gitdir);
+      if (wt) dir = gitdir.slice(0, wt.index).replace(/\/\.git$/, "");
+    }
+  } catch {
+    // `.git` is a directory (plain repo) or missing: cwd is the project.
+  }
+  projectDirCache.set(cwd, dir);
+  return dir;
+}
+
 // omp extension factory: runs once per session (main + every subagent) against
 // this one module instance. Registers only; nothing touches the DB at load.
 function mempg(pi: ExtensionAPI): void {
@@ -1906,19 +1937,21 @@ function mempg(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", async (event, ctx) => {
     // Injection: extend the event's systemPrompt (it carries earlier
-    // extensions' chained overrides); cwd is read per event since /move changes it.
+    // extensions' chained overrides); cwd is read per event since /move
+    // changes it, and a worktree checkout maps to its main repo root.
+    const project = await resolveProjectDir(ctx.cwd);
     const output: { system: string[] } = { system: [] };
     // Keyword capture, main session only: subagent prompts aren't the user's.
     if (ctx.agent.kind === "main" && extractMemoryRequest(event.prompt) !== null) {
       if (firstSighting(event.prompt)) {
-        track(inflightCaptures, captureFromPrompt(event.prompt, ctx.cwd, ctx.sessionManager.getSessionId()));
+        track(inflightCaptures, captureFromPrompt(event.prompt, project, ctx.sessionManager.getSessionId()));
       }
       // memory_remember is always loaded and its description says to write on
       // user statements, so without this the model stores the same request a
       // second time. Emitted on re-runs too: each run rebuilds the prompt.
       output.system.push(CAPTURE_NOTE);
     }
-    await handleTransform(output, ctx.cwd, capPromptQuery(event.prompt));
+    await handleTransform(output, project, capPromptQuery(event.prompt));
     if (output.system.length === 0) return;
     return { systemPrompt: [...event.systemPrompt, ...output.system] };
   });
@@ -1943,7 +1976,10 @@ function mempg(pi: ExtensionAPI): void {
       loadMode: "essential",
       approval: spec.readOnly ? "read" : "write",
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-        const text = await spec.run(params, { directory: ctx.cwd, sessionID: ctx.sessionManager.getSessionId() });
+        const text = await spec.run(params, {
+          directory: await resolveProjectDir(ctx.cwd),
+          sessionID: ctx.sessionManager.getSessionId(),
+        });
         return { content: [{ type: "text", text }] };
       },
     });
@@ -1971,6 +2007,7 @@ const __internals = {
   TOOL_SPECS,
   toZod,
   invalidateInjection,
+  resolveProjectDir,
   resolveSslMode,
   clampInt,
   validateWrite,
