@@ -334,6 +334,10 @@ describe("DB access layer", () => {
         expect(result).toContain("not deleted");
         expect(await alive(id)).toEqual([1]);
 
+        // global: true overrides the boundary - the blocked delete goes through.
+        expect(await __internals.forget({ id, global: true }, { directory: "/tmp/mempg-test-forget-attacker" })).toBe(`Deleted memory #${id}.`);
+        expect(await alive(id)).toEqual([0]);
+
         // A stack_fact from another project IS deletable - global types are
         // every project's to maintain.
         const stackId = await storeId("Stack fact: the CI runner image is rebuilt weekly.", other, { type: "stack_fact" });
@@ -561,6 +565,13 @@ describe("DB access layer", () => {
         expect(result).toContain("not updated");
         const [row] = await __internals.sql`SELECT content FROM memories WHERE id = ${id}` as { content: string }[];
         expect(row.content).toBe("Foreign project fact that stays put.");
+
+        // global: true overrides the boundary - the blocked update goes through.
+        expect(
+          await __internals.updateMemory({ id, content: "Foreign project fact, merged from another project.", global: true }, ctx),
+        ).toBe(`Updated memory #${id}.`);
+        const [row2] = await __internals.sql`SELECT content FROM memories WHERE id = ${id}` as { content: string }[];
+        expect(row2.content).toBe("Foreign project fact, merged from another project.");
 
         // stack_fact from another project: updatable - global types are shared.
         const stackId = await storeId("Stack fact: the module requires lifecycle ignore_changes.", other, { type: "stack_fact" });

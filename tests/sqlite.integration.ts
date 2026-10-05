@@ -137,6 +137,7 @@ describe("sqlite backend", () => {
     expect(fromB).not.toContain(`#${local}`);
     expect(await __internals.recall({ query: "zzvis", global: true }, { directory: b })).toContain(`#${local}`);
     expect(await __internals.forget({ id: local }, { directory: b })).toContain("not deleted");
+    expect(await __internals.forget({ id: local, global: true }, { directory: b })).toBe(`Deleted memory #${local}.`);
   });
 
   test("supersede hides the old row, rolls back on a foreign target, and unlinks when the new row is forgotten", async () => {

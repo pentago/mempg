@@ -22,8 +22,8 @@ type RememberArgs = {
   type?: MemoryType;
   supersedes?: number;
 };
-type ForgetArgs = { id: number };
-type UpdateArgs = { id: number; content: string; tags?: string[]; type?: MemoryType };
+type ForgetArgs = { id: number; global?: boolean };
+type UpdateArgs = { id: number; content: string; tags?: string[]; type?: MemoryType; global?: boolean };
 type TagsArgs = { limit?: number; global?: boolean };
 type ConsolidateArgs = { dryRun?: boolean };
 type RetagArgs = { old: string; new: string };
@@ -1068,8 +1068,9 @@ async function captureFromPrompt(
   }
 }
 
-// project_fact rows are origin-scoped (one customer's agent must not delete
-// another's facts); stack_fact is maintainable from any project.
+// project_fact rows are origin-scoped by default (one customer's agent must
+// not silently delete another's facts); global: true overrides the boundary,
+// and stack_fact is maintainable from any project regardless.
 async function forget(
   args: ForgetArgs,
   ctx: { directory: string },
@@ -1082,18 +1083,20 @@ async function forget(
     await ready();
     const deleted = await sql`
       DELETE FROM memories
-      WHERE id = ${id} AND ${visibleRows(sql, ctx.directory)}
+      WHERE id = ${id} ${args.global ? sql`` : sql`AND ${visibleRows(sql, ctx.directory)}`}
       RETURNING id
     ` as { id: number }[];
 
     if (deleted.length === 0) {
       const exists = await sql`SELECT project, memory_type FROM memories WHERE id = ${id}` as { project: string; memory_type: string }[];
       if (exists.length > 0) {
-        return `Memory #${id} is a ${exists[0].memory_type} belonging to ${exists[0].project}; not deleted. Only that project's agent can delete it.`;
+        return `Memory #${id} is a ${exists[0].memory_type} belonging to ${exists[0].project}; not deleted. ` +
+          `Only that project's agent can delete it, or retry with global: true.`;
       }
       return `No memory #${id}; nothing deleted.`;
     }
-    invalidateInjection(ctx.directory);
+    if (args.global) injectionCache.clear();
+    else invalidateInjection(ctx.directory);
     return `Deleted memory #${id}.`;
   } catch (e: unknown) {
     return toolError("forget", "forget", e);
@@ -1129,18 +1132,19 @@ async function updateMemory(
           ${typeCond}
           updated_at = ${nowSql(sql)},
           embedding = NULL
-      WHERE id = ${id} AND ${visibleRows(sql, ctx.directory)}
+      WHERE id = ${id} ${args.global ? sql`` : sql`AND ${visibleRows(sql, ctx.directory)}`}
       RETURNING id
     ` as { id: number }[];
 
     if (updated.length === 0) {
       const exists = await sql`SELECT project, memory_type FROM memories WHERE id = ${id}` as { project: string; memory_type: string }[];
       if (exists.length > 0) {
-        return `Memory #${id} is a ${exists[0].memory_type} belonging to ${exists[0].project}; not updated. Only that project's agent can edit it.`;
+        return `Memory #${id} is a ${exists[0].memory_type} belonging to ${exists[0].project}; not updated. Only that project's agent can edit it, or retry with global: true.`;
       }
       return `No memory #${id}; nothing updated.`;
     }
-    invalidateInjection(ctx.directory);
+    if (args.global) injectionCache.clear();
+    else invalidateInjection(ctx.directory);
     // The UPDATE cleared the old vector, so a failed re-embed leaves the row
     // keyword-only rather than matching content it no longer holds.
     embedInBackground(id, args.content);
@@ -1462,14 +1466,14 @@ async function consolidate(args: ConsolidateArgs = {}): Promise<string> {
           `(kept the newest of each; [wording] = matched by trigram similarity, [meaning] = matched by embedding similarity).`,
       );
       if (!dryRun) {
-        summary.push("Check the removed texts - if any carries a fact the kept memory lacks, merge it in with memory_update:");
+        summary.push("Check the removed texts - if any carries a fact the kept memory lacks, merge it in with memory_update (global: true if the kept memory is another project's):");
       }
     }
     if (uncertainPairs > 0) {
       summary.push(
         `${uncertainPairs} similar pair${uncertainPairs === 1 ? "" : "s"} flagged [meaning-uncertain]: high embedding similarity but a specific ` +
           `number, path, or name differs, so nothing was auto-merged - review each and use memory_update to merge if it's genuinely the same ` +
-          `fact, or leave both if they're distinct.`,
+          `fact (global: true for another project's memory), or leave both if they're distinct.`,
       );
     }
     return `${summary.join("\n")}\n\n${report.join("\n")}`;
@@ -1628,11 +1632,16 @@ const TOOL_SPECS: readonly ToolSpec[] = [
     description:
       "Delete a memory by id (get ids from memory_recall). Use for memories that are wrong or obsolete; prefer storing a corrected memory when the old one is still useful history. " +
       "stack_fact can be deleted from any project; project_fact can only be " +
-      "deleted by its origin project (the delete will fail with the owning project's name).",
+      "deleted by its origin project unless global: true overrides the boundary.",
     input: {
       type: "object",
       properties: {
         id: { type: "number", description: "The #id shown by memory_recall" },
+        global: {
+          type: "boolean",
+          description:
+            "Also allow deleting another project's project_fact memory (default: only this project's project_fact memories, plus all stack_fact memories).",
+        },
       },
       required: ["id"],
       additionalProperties: false,
@@ -1646,7 +1655,8 @@ const TOOL_SPECS: readonly ToolSpec[] = [
     description:
       "Rewrite an existing memory by id (get ids from memory_recall). Use when a memory is outdated but still worth keeping: the corrected content replaces the old, keeping the original learned date. " +
       "Omitted tags/type are kept as-is. stack_fact can be edited from any " +
-      "project; project_fact can only be edited by its origin project. " +
+      "project; project_fact can only be edited by its origin project unless " +
+      "global: true overrides the boundary. " +
       "For obsolete memories use memory_forget; for genuinely new memories use memory_remember.",
     input: {
       type: "object",
@@ -1666,6 +1676,11 @@ const TOOL_SPECS: readonly ToolSpec[] = [
           type: "string",
           enum: [...MEMORY_TYPES],
           description: "Replaces the memory type; omit to keep the current type",
+        },
+        global: {
+          type: "boolean",
+          description:
+            "Also allow editing another project's project_fact memory (default: only this project's project_fact memories, plus all stack_fact memories).",
         },
       },
       required: ["id", "content"],

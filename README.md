@@ -82,7 +82,7 @@ The type decides where a memory is visible:
 
 A rule of thumb: would this help in another customer's repo that uses the same tools? Yes means `stack_fact`.
 
-The same boundary applies to changes. A project can't edit, delete or retag another project's `project_fact`; the call fails and names the owning project. `memory_recall` and `memory_tags` take `global: true` to also read other projects' `project_fact` memories.
+The same boundary applies to changes. A project can't edit, delete or retag another project's `project_fact`; the call fails and names the owning project. `memory_recall` and `memory_tags` take `global: true` to also read other projects' `project_fact` memories, and `memory_forget`/`memory_update` take it to override the write boundary (e.g. to finish a `memory_consolidate` cleanup from anywhere).
 
 ### How memories get saved
 
