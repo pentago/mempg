@@ -64,6 +64,7 @@ Errors and fallbacks go to the omp log in `~/.omp/logs/`, never to your terminal
 - **Keep memories self-contained.** "Use jose, not jsonwebtoken, for Edge compatibility" makes sense on its own. "We picked the second option" does not.
 - **Replace, don't pile up.** When a fact changes, save the new one with `supersedes` pointing at the old one.
 - **Clean up now and then.** Run `memory_consolidate` with `dryRun: true` to preview, then run it for real.
+- **Check it pays off.** The bundled `mempg-eval` skill reports how often memories are stored and recalled, how many saves the end-of-turn checkpoint prompts, and whether recalled memories changed what the agent did.
 
 ---
 
