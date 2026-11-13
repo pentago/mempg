@@ -10,5 +10,5 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["mempg.ts", "tests/**/*.ts", "bench/**/*.ts"]
+  "include": ["mempg.ts", "tests/**/*.ts", "bench/**/*.ts", "skills/**/*.ts"]
 }

@@ -1,6 +1,6 @@
 {
   "name": "@dzhi/mempg",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "Persistent memory extension for oh-my-pi (omp), on Postgres + pgvector or SQLite",
   "scripts": {
@@ -18,7 +18,8 @@
     ".": "./mempg.ts"
   },
   "files": [
-    "mempg.ts"
+    "mempg.ts",
+    "skills"
   ],
   "omp": {
     "extensions": [
@@ -38,10 +39,10 @@
     "url": "https://github.com/pentago/mempg.git"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.14",
-    "@types/bun": "^1.4.2",
+    "@biomejs/biome": "^2.6.7",
+    "@types/bun": "^1.4.4",
     "typescript": "^7.0.2",
-    "@oh-my-pi/pi-coding-agent": "^18.3.5",
-    "@oh-my-pi/omptype": "^18.3.5"
+    "@oh-my-pi/pi-coding-agent": "^18.20.0",
+    "@oh-my-pi/omptype": "^18.20.0"
   }
 }

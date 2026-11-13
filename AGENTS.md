@@ -3,7 +3,7 @@
 ## Project Overview
 
 mempg is a **single-file** oh-my-pi (omp) extension (`mempg.ts`). It gives agents persistent memory backed by Postgres (`pgvector`, the default) or a local SQLite file (`MEMPG_BACKEND=sqlite`), with optional Ollama embeddings.
-- It is published as `@dzhi/mempg`, and only `mempg.ts` ships.
+- It is published as `@dzhi/mempg`; only `mempg.ts` and `skills/` ship.
 - `README.md` is the user-facing feature doc. This file covers workflow, patterns and traps.
 
 ## Architecture & Data Flow
@@ -54,6 +54,7 @@ mempg is a **single-file** oh-my-pi (omp) extension (`mempg.ts`). It gives agent
 | `deploy/` | `compose.yaml` (pgvector + optional ollama), `init/01-init.sh` (**authoritative Postgres DDL**), `backfill.ts`, `pg-to-sqlite.ts`, upgrade SQL in `README.md` |
 | `bench/` | `backend-compare.ts` (Postgres vs SQLite, all tools, scratch targets only) and the consolidate benchmarks: `embeddinggemma-calibration.ts` (26 pairs, no DB) and `mempg-shaped-consolidate.ts` (808 pairs, scratch Postgres DB). Re-run the latter two when changing the embed model or `detailConflicts` |
 | `scripts/check-tag-version.sh` | pre-push guard: tag must equal `package.json` version |
+| `skills/mempg-eval/` | Shipped omp skill: `eval.ts` reports memory tool usage from session transcripts + DB (SELECTs only, no `ready()`); `SKILL.md` adds the model-judged usefulness step. Keep its log parsing in step with `CHECKPOINT_NOTE`, the `Stored memory #N` and `No memories found.` result strings |
 | `.github/workflows/` | `check.yml` (PRs: lint, typecheck, test); `publish.yml` (`v*` tag → npm) |
 
 ## Development Commands
