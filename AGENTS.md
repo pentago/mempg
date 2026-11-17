@@ -88,8 +88,8 @@ pre-commit install && pre-commit install --hook-type pre-push
   - Side effects are fire-and-forget: `void p.catch(e => logError(kind, …))`.
   - Degradation paths return `null` instead of throwing.
 - **Write caps**:
-  - Content is 10-4000 chars; at most 10 tags, each up to 64 chars. These are abuse guards: reject with the actual size, never truncate.
-  - A write over 700 chars gets a non-blocking nudge.
+  - Content is 10-8000 chars; at most 10 tags, each up to 64 chars. These are abuse guards: reject with the actual size, never truncate.
+  - A write over 4000 chars (`INJECTION_CUT`, where injection truncation starts) gets a non-blocking nudge. Auto-capture of "remember that…" prompts stays capped at 700 chars.
 - **Supersede**: `memory_remember`'s `supersedes` is checked inside the INSERT (`INSERT … SELECT … WHERE EXISTS`), so an unreachable target saves nothing. If the target changes before the link UPDATE, the new row is deleted again. The extension uses no `sql.begin`: on Bun's single SQLite connection, overlapping transactions fail, and any other query run while one is open joins it and is rolled back with it.
 - **Injection**:
   - Always extend `event.systemPrompt`, never `ctx.getSystemPrompt()`.
