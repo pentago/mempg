@@ -377,17 +377,17 @@ describe("DB access layer", () => {
     test("QA failure: oversized content is rejected with its actual length", async () => {
       // Rejected rather than truncated so the agent can retry shorter instead of
       // silently storing a clipped memory.
-      const result = await __internals.remember({ content: "x".repeat(4001) }, ctx);
+      const result = await __internals.remember({ content: "x".repeat(8001) }, ctx);
       expect(result).toContain("ERROR");
-      expect(result).toContain("4001");
-      expect(result).toContain("max 4000");
+      expect(result).toContain("8001");
+      expect(result).toContain("max 8000");
     });
 
-    test("QA happy: content exactly at the 4000 cap is accepted", async () => {
+    test("QA happy: content exactly at the 8000 cap is accepted", async () => {
       const project = "/tmp/mempg-test-cap";
       try {
         const result = await __internals.remember(
-          { content: `boundary ${Date.now()} ${"x".repeat(4000 - 24)}` },
+          { content: `boundary ${Date.now()} ${"x".repeat(8000 - 24)}` },
           { directory: project, sessionID: "test-cap" },
         );
         expect(result).toContain("Stored memory #");
@@ -2039,7 +2039,7 @@ describe("DB access layer", () => {
   describe("length nudge on memory_remember / memory_update", () => {
     const ctx = { directory: `/tmp/mempg-test-nudge-${Date.now()}`, sessionID: "nudge" };
 
-    test("QA: a write at or under 700 characters gets the plain success message, no nudge", async () => {
+    test("QA: a write at or under 4000 characters gets the plain success message, no nudge", async () => {
       const content = `Short nudge-test memory ${Date.now()}.`;
       try {
         const result = await __internals.remember({ content }, ctx);
@@ -2050,13 +2050,13 @@ describe("DB access layer", () => {
       }
     });
 
-    test("QA: a write over 700 characters succeeds and the response includes the nudge", async () => {
-      const content = `Long nudge-test memory ${Date.now()}: ${"x".repeat(750)}`;
+    test("QA: a write over 4000 characters succeeds and the response includes the nudge", async () => {
+      const content = `Long nudge-test memory ${Date.now()}: ${"x".repeat(4050)}`;
       try {
         const result = await __internals.remember({ content }, ctx);
         expect(result).toContain("Stored memory #");
-        expect(result).toContain(`${content.length}`);
-        expect(result).toContain("injection truncates at 600");
+        expect(result).toContain(content.length.toLocaleString());
+        expect(result).toContain("injection truncates at 4000");
       } finally {
         await __internals.sql`DELETE FROM memories WHERE content = ${content}`;
       }
@@ -2066,11 +2066,11 @@ describe("DB access layer", () => {
       const content = `Update-nudge-test memory ${Date.now()}.`;
       try {
         const id = await storeId(content, ctx.directory);
-        const longContent = `Updated nudge-test memory ${Date.now()}: ${"z".repeat(750)}`;
+        const longContent = `Updated nudge-test memory ${Date.now()}: ${"z".repeat(4050)}`;
         const result = await __internals.updateMemory({ id, content: longContent }, ctx);
         expect(result).toContain(`Updated memory #${id}.`);
-        expect(result).toContain(`${longContent.length}`);
-        expect(result).toContain("injection truncates at 600");
+        expect(result).toContain(longContent.length.toLocaleString());
+        expect(result).toContain("injection truncates at 4000");
       } finally {
         await purge(ctx.directory);
       }

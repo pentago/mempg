@@ -415,9 +415,11 @@ async function settleEmbeddings(): Promise<void> {
 let injectionMode: "relevance" | "recency" =
   process.env.MEMPG_INJECTION === "recency" ? "recency" : "relevance";
 
+const INJECTION_CUT = 4000;
+
 function truncateMemory(content: string): string {
-  if (content.length <= 600) return content;
-  return `${content.slice(0, 600)}…[truncated]`;
+  if (content.length <= INJECTION_CUT) return content;
+  return `${content.slice(0, INJECTION_CUT)}…[truncated]`;
 }
 
 // Memory content is interpolated verbatim into the system prompt; a stored
@@ -688,20 +690,21 @@ async function dispose(): Promise<void> {
 // --- Agent tools: recall + remember with dedup-on-write ---
 
 // Write caps are abuse guards, far above ordinary memories.
-const MAX_CONTENT = 4000;
+const MAX_CONTENT = 8000;
 const MIN_CONTENT = 10;
 const MAX_TAGS = 10;
 const MAX_TAG_LENGTH = 64;
 
-// Soft nudge, never a rejection: just above formatBlock's 600-char injection cut.
-const CONTENT_LENGTH_NUDGE = 700;
+// Auto-capture takes sentences, not pasted text; independent of INJECTION_CUT.
+const CAPTURE_MAX_LENGTH = 700;
 
+// Soft nudge, never a rejection: fires exactly where injection starts truncating.
 function lengthNudge(content: string): string {
-  if (content.length <= CONTENT_LENGTH_NUDGE) return "";
+  if (content.length <= INJECTION_CUT) return "";
   return (
-    ` Note: this entry is ${content.length.toLocaleString()} characters - injection truncates at 600, ` +
-    "so most of this won't be visible in ambient context. Consider shortening to the essential " +
-    "1-3 sentences and putting longer rationale in project docs."
+    ` Note: this entry is ${content.length.toLocaleString()} characters - injection truncates at ${INJECTION_CUT}, ` +
+    "so the tail won't be visible in ambient context (memory_recall still returns it in full). " +
+    "Put the essentials first."
   );
 }
 
@@ -921,7 +924,7 @@ function validateWrite(args: RememberArgs): string | null {
     return `ERROR: content must be at least ${MIN_CONTENT} characters.`;
   }
   if (content.length > MAX_CONTENT) {
-    return `ERROR: content is ${content.length} characters, max ${MAX_CONTENT}; store the essentials in 1-3 sentences and retry.`;
+    return `ERROR: content is ${content.length} characters, max ${MAX_CONTENT}; trim to the essentials and retry.`;
   }
   const tags = args.tags ?? [];
   if (!Array.isArray(tags)) return "ERROR: tags must be an array of strings.";
@@ -1029,7 +1032,7 @@ const INTERROGATIVE_RE = /^(?:when|what|where|why|how|who|whom|whose|which|did)\
 // count before it), is glued to a path/member access (preceded by a backtick,
 // dot, or slash), or is a call/code token (followed by "(" even across spaces,
 // or by an adjacent backtick - "remember that `bun test` ..." is still prose). The payload stops at the first
-// blank line, and a payload over CONTENT_LENGTH_NUDGE is skipped rather than
+// blank line, and a payload over CAPTURE_MAX_LENGTH is skipped rather than
 // truncated - a real "remember that X" is a sentence, not a pasted document.
 // Known limitation: a stray unmatched backtick before a genuine trigger
 // suppresses capture; the model can still call memory_remember itself.
@@ -1045,7 +1048,7 @@ function extractMemoryRequest(text: string): string | null {
     if (rest[0] === "`" || rest.trimStart()[0] === "(") continue;
     const payload = text.slice(start + match[0].length).split(/\n\s*\n/, 1)[0].trim();
     if (!payload || INTERROGATIVE_RE.test(payload)) continue;
-    if (payload.length > CONTENT_LENGTH_NUDGE) continue;
+    if (payload.length > CAPTURE_MAX_LENGTH) continue;
     return payload;
   }
   return null;
@@ -1589,7 +1592,7 @@ const TOOL_SPECS: readonly ToolSpec[] = [
       properties: {
         content: {
           type: "string",
-          description: `1-3 self-contained sentences capturing the why (${MIN_CONTENT}-${MAX_CONTENT} characters)`,
+          description: `Complete, self-contained memory: the fact, why it holds, and the details needed to act on it (${MIN_CONTENT}-${MAX_CONTENT} characters)`,
         },
         type: {
           type: "string",
@@ -1665,7 +1668,7 @@ const TOOL_SPECS: readonly ToolSpec[] = [
         id: { type: "number", description: "The #id shown by memory_recall" },
         content: {
           type: "string",
-          description: `1-3 self-contained sentences replacing the old content (${MIN_CONTENT}-${MAX_CONTENT} characters)`,
+          description: `Complete, self-contained replacement: the fact, why it holds, and the details needed to act on it (${MIN_CONTENT}-${MAX_CONTENT} characters)`,
         },
         tags: {
           type: "array",
@@ -1821,7 +1824,7 @@ const CHECKPOINT_MIN_TOOL_CALLS = 8;
 const CHECKPOINT_NOTE =
   "<mempg-checkpoint>Before this turn ends, check whether it produced anything worth keeping: " +
   WRITE_TRIGGERS.join("; ") +
-  ". Store each such fact now with memory_remember (one fact per call, 1-3 sentences). " +
+  ". Store each such fact now with memory_remember (one fact per call, with the why and the details needed to act on it). " +
   "If nothing qualifies, reply only \"No new memories.\"</mempg-checkpoint>";
 
 function isObject(x: unknown): x is Record<string, unknown> {

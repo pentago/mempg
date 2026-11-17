@@ -93,7 +93,7 @@ The same boundary applies to changes. A project can't edit, delete or retag anot
 
 Each new memory is embedded in the background with Ollama. If Ollama is down, the memory is still saved, and only keyword search finds it until `bun run backfill` embeds it.
 
-Limits: 10-4000 characters and up to 10 tags. Too-large writes are rejected, not truncated. Long memories get a warning, because only the start of each one is shown to the agent.
+Limits: 10-8000 characters and up to 10 tags. Too-large writes are rejected, not truncated. Memories over 4000 characters get a warning, because only the first 4000 are shown to the agent at session start (`memory_recall` returns them in full).
 
 ### How memories come back
 
