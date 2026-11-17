@@ -684,7 +684,10 @@ describe("DB access layer", () => {
               ON CONFLICT DO NOTHING
             `;
           }
-          const result = await __internals.recall({ query: `${marker} ${rare}`, limit: 5 }, ctx);
+          // No sessionID: ranking ignores it, and recall then skips its
+          // fire-and-forget memory_recalls INSERT, which would otherwise
+          // deadlock with purge's cascading DELETE.
+          const result = await __internals.recall({ query: `${marker} ${rare}`, limit: 5 }, { directory: ctx.directory });
           expect(result.indexOf(`#${strongerId}`)).toBeGreaterThan(-1);
           expect(result.indexOf(`#${strongerId}`)).toBeLessThan(result.indexOf(`#${weakerId}`));
         });

@@ -1,3 +1,4 @@
 data/
 ollama-models/
 .env*
+!.env.example
