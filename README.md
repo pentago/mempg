@@ -138,6 +138,6 @@ bun run test:sqlite  # the SQLite backend, against a throwaway /tmp file
 pre-commit install && pre-commit install --hook-type pre-push
 ```
 
-The hooks run lint and typecheck on commit, and check that a pushed tag matches the `package.json` version. `bun test` writes to the database it's pointed at, so use a throwaway one. CI runs it against a fresh Postgres container.
+The hooks run lint and typecheck on commit, and check that a pushed tag matches the `package.json` version. `bun test` writes to the database it's pointed at and merges duplicates across that whole database. With no `MEMPG_*` set, that is your real one (`localhost`, database `mempg`), so always point `MEMPG_*` at a throwaway database first. CI runs it against a fresh Postgres container.
 
 Upgrading an existing database: see [`deploy/README.md`](./deploy/README.md#upgrading-an-existing-install). Benchmarks, including a Postgres-vs-SQLite comparison, live in [`bench/`](./bench/README.md).

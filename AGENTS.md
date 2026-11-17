@@ -14,7 +14,7 @@ mempg is a **single-file** oh-my-pi (omp) extension (`mempg.ts`). It gives agent
 - **Handlers**:
   - `before_agent_start`:
     - captures "remember that…" prompts deterministically (main session only, no LLM);
-    - always appends the memory block to `event.systemPrompt`, even with zero rows.
+    - appends the memory block to `event.systemPrompt`, even with zero rows (not on deadline or error).
   - `session_stop` requests one hidden continuation to store learnings, only if all of these hold:
     - the turn made ≥8 tool calls;
     - none of them was `memory_remember` or `memory_update`;
@@ -25,7 +25,7 @@ mempg is a **single-file** oh-my-pi (omp) extension (`mempg.ts`). It gives agent
   - They are converted to zod via `toZod(pi.zod, …)` and registered with `loadMode: "essential"`.
 - **Visibility**:
   - `visibleRows()` is the single project boundary: `stack_fact` is global, `project_fact` only from its origin project.
-  - Reads (injection, recall, tags) also apply `notSuperseded()`. Only recall and tags accept `global: true` to widen reach; injection never does.
+  - Reads (injection, recall, tags) also apply `notSuperseded()`. Of the reads, only recall and tags accept `global: true` to widen reach; injection never does.
   - Writes (retag and the supersede link) are always bounded by `visibleRows()`. `forget`/`update` are bounded by default but take `global: true` to override (matching recall's read opt-in), so a consolidate cleanup can finish from any directory; a global write clears the whole `injectionCache`. Writes skip `notSuperseded()`, so superseded rows stay fixable.
 - **Backends**: `SQLITE` (from `MEMPG_BACKEND`) is fixed at load; one `sql` client serves both, Bun's `SQL` with the sqlite adapter or a Postgres pool.
   - Dialect differences live in small builders in the `// --- Dialect ---` section (`dateCol`, `nowSql`, `tagsParam`, `idIn`, `vectorParam`, `ftsJoin`/`ftsMatch`, `keywordScore`, `nearest`), plus inline `SQLITE ?` branches for retag, tag listing, the recall-record insert and the consolidate meaning pass.
@@ -34,15 +34,22 @@ mempg is a **single-file** oh-my-pi (omp) extension (`mempg.ts`). It gives agent
   - bm25's scale depends on corpus size, so on SQLite `keywordScore` applies the project/cross-session boosts as multipliers, not Postgres' additive constants.
   - "Newest" orderings end in `id DESC`: SQLite timestamps are millisecond text and tie.
 - **Retrieval**:
-  - Keyword FTS is merged with pgvector cosine search via RRF (`hybridMerge`: k=60, top 2 vector rows reserved).
-  - Any embed failure degrades silently to keyword-only.
-  - Writes embed fire-and-forget (`embedInBackground`; `settleEmbeddings()` waits in tests/benches). A NULL embedding means keyword-only until `bun run backfill`. `memory_update` clears the vector in the same UPDATE, and `embedAndStore` only writes while the row still holds the embedded content.
+  - Keyword FTS is merged with pgvector cosine search via RRF (`hybridMerge`: k=60). Injection reserves the top 2 vector rows; recall reserves `min(2, floor(limit/2))`.
+  - An embed failure logs once (rate-limited) and degrades to keyword-only.
+  - If keyword and vector both find nothing, injection falls back to the recency query.
+  - Writes embed fire-and-forget (`embedInBackground`; `settleEmbeddings()` waits in tests/benches). `session_shutdown` does not await embeds, so a lost embed leaves NULL. A NULL embedding means keyword-only until `bun run backfill`. `memory_update` clears the vector in the same UPDATE, and `embedAndStore` only writes while the row still holds the embedded content. `deploy/backfill.ts` has no such content guard.
+  - Embed-model switch: backfill fills only NULL rows and refuses a dimension mismatch. Postgres: drop and re-add `embedding` as `vector(N)` (see `deploy/README.md`), then backfill. SQLite or same-dimension model: NULL every embedding, then backfill (old same-dim vectors silently mis-rank otherwise).
 - **Consolidate** runs two passes:
   1. **Wording**: trigram similarity, computed in TS, with the project boundary enforced by `mutuallyVisibleRows()`.
   2. **Meaning**: embedding cosine, computed in SQL on Postgres (boundary: `mutuallyVisible()`, prefilter: `isTemplatedAutoLogPair`) and in TS on SQLite (`mutuallyVisibleRows()`). Both backends drop templated auto-logs with `isTemplatedContent()`.
   - The meaning pass excludes the wording pass's removals in both real and `dryRun` mode, so a preview matches a real run on the same snapshot.
   - `detailConflicts` routes a pair with a conflicting number, path or proper noun to `[meaning-uncertain]` instead of deleting it.
-- **Cache invalidation is asymmetric**: remember, forget and update clear only the caller's directory — except a `global: true` forget/update, which can touch any project's row and clears the whole `injectionCache`. `retag` and a real `consolidate` also clear the whole `injectionCache`.
+- **Cache invalidation is asymmetric**: remember, forget and update clear only the caller's directory — except a `global: true` forget/update, which can touch any project's row and clears the whole `injectionCache`. `retag` and a real `consolidate` (only when `removed > 0`) also clear the whole `injectionCache`.
+  - Known gap: a `stack_fact` write is visible to every project but clears only the caller's entry, so other projects' cached blocks stay stale until FIFO eviction (32 entries) or a prompt-hash change.
+- **Project identity and deadlines**:
+  - `resolveProjectDir` maps git worktrees to the main repo root, so every project key is the root path.
+  - Injection queries have a 1000 ms deadline, query embeds 750 ms, write embeds 15 s. `withDeadline` races; it does not cancel. On deadline or error, injection appends nothing.
+  - Pool: max 2 connections, 3 s connect timeout, SSL off by default. SQLite default path: `~/.omp/agent/mempg.db`.
 
 ## Key Directories
 
@@ -55,7 +62,7 @@ mempg is a **single-file** oh-my-pi (omp) extension (`mempg.ts`). It gives agent
 | `bench/` | `backend-compare.ts` (Postgres vs SQLite, all tools, scratch targets only) and the consolidate benchmarks: `embeddinggemma-calibration.ts` (26 pairs, no DB) and `mempg-shaped-consolidate.ts` (808 pairs, scratch Postgres DB). Re-run the latter two when changing the embed model or `detailConflicts` |
 | `scripts/check-tag-version.sh` | pre-push guard: tag must equal `package.json` version |
 | `skills/mempg-eval/` | Shipped omp skill: `eval.ts` reports memory tool usage from session transcripts + DB (SELECTs only, no `ready()`); `SKILL.md` adds the model-judged usefulness step. Keep its log parsing in step with `CHECKPOINT_NOTE`, the `Stored memory #N` and `No memories found.` result strings |
-| `.github/workflows/` | `check.yml` (PRs: lint, typecheck, test); `publish.yml` (`v*` tag → npm) |
+| `.github/workflows/` | `check.yml` (PRs: lint, typecheck, test); `publish.yml` (`v*` tag → npm; its `workflow_dispatch` trigger always fails the tag check) |
 
 ## Development Commands
 
@@ -66,13 +73,14 @@ bun run typecheck    # tsc --noEmit
 bun test             # needs live Postgres
 bun run test:sqlite  # SQLite backend, /tmp file, fake in-process embedder
 bun run backfill     # embed NULL-embedding rows (either backend)
-bun run port:sqlite  # copy Postgres memories into an empty SQLite file
+bun run port:sqlite  # copy Postgres memories into an EMPTY SQLite file (refuses non-empty; no catch-up path)
 pre-commit install && pre-commit install --hook-type pre-push
 ```
 
 - **Formatter**: Biome's formatter is **disabled** and the source is hand-wrapped. Never run a formatter over it.
-- **Pre-commit hooks** typecheck the whole project. Staging `mempg.ts` without matching `tests/` changes can fail.
-- **Bench scripts** (`bun run bench:*`): `mempg-shaped-consolidate` DROPs and recreates its scratch DB on whatever server `MEMPG_*` points to. Always set `MEMPG_*` explicitly.
+- **Pre-commit hooks** (`language: system`, need `pre-commit` and `bunx` on PATH) run `biome check .` and `tsc --noEmit` over the whole working tree, not just the staged files. Any unrelated lint or type error blocks a `.ts` commit.
+- **Bench scripts** (`bun run bench:*`): `mempg-shaped-consolidate` DROPs and recreates its scratch DB on whatever server `MEMPG_*` points to. Always set `MEMPG_*` explicitly (`MEMPG_BENCH_OLLAMA` overrides its Ollama URL).
+- **Lint/typecheck scope**: Biome and `tsc` cover only `mempg.ts`, `tests/`, `bench/`, `skills/`. `deploy/*.ts` and `scripts/` are never checked; test those by running them.
 
 ## Code Conventions & Common Patterns
 
@@ -89,7 +97,7 @@ pre-commit install && pre-commit install --hook-type pre-push
   - Degradation paths return `null` instead of throwing.
 - **Write caps**:
   - Content is 10-8000 chars; at most 10 tags, each up to 64 chars. These are abuse guards: reject with the actual size, never truncate.
-  - A write over 4000 chars (`INJECTION_CUT`, where injection truncation starts) gets a non-blocking nudge. Auto-capture of "remember that…" prompts stays capped at 700 chars.
+  - A write over 4000 chars (`INJECTION_CUT`, where injection truncation starts) gets a non-blocking nudge. Auto-capture of "remember that…" prompts skips (does not truncate) anything over 700 chars, and also skips odd backticks, paths, call sites and questions.
 - **Supersede**: `memory_remember`'s `supersedes` is checked inside the INSERT (`INSERT … SELECT … WHERE EXISTS`), so an unreachable target saves nothing. If the target changes before the link UPDATE, the new row is deleted again. The extension uses no `sql.begin`: on Bun's single SQLite connection, overlapping transactions fail, and any other query run while one is open joins it and is rolled back with it.
 - **Injection**:
   - Always extend `event.systemPrompt`, never `ctx.getSystemPrompt()`.
@@ -104,8 +112,8 @@ pre-commit install && pre-commit install --hook-type pre-push
 
 ## Runtime/Tooling Preferences
 
-- **Bun only**: runtime, package manager and test runner. TypeScript + Biome.
-- **Runtime imports** must be Bun built-ins only.
+- **Bun only**: runtime, package manager and test runner. TypeScript + Biome. The one exception is `publish.yml`, which uses Node 24 + `npm publish`.
+- **Runtime imports** must be built-in modules only (`bun`, `node:*`). `tsconfig.json` has `verbatimModuleSyntax`, so type-only imports need `import type`.
   - omp packages are `import type` devDependencies.
   - A new runtime import needs a real `dependencies` entry.
 - **Bun SQL traps**:
@@ -123,21 +131,26 @@ pre-commit install && pre-commit install --hook-type pre-push
 
 ## Testing & QA
 
-- **Framework and CI**: `bun:test`, with no coverage tooling. CI runs on PRs against a pgvector container bootstrapped by `deploy/init/01-init.sh`, with no Ollama, so it runs keyword-only; then `bun run test:sqlite`, which needs neither.
+- **Framework and CI**: `bun:test`, with no coverage tooling. CI installs with `bun install --frozen-lockfile` (commit `bun.lock` with any dependency change) and runs on PRs against `pgvector/pgvector:0.8.6-pg18-trixie` bootstrapped by `deploy/init/01-init.sh`, with no Ollama, so it runs keyword-only; then `bun run test:sqlite`, which needs neither. The image tag is pinned in `compose.yaml`, `check.yml` and the upgrade docs; bump all three together.
 - **SQLite tests** run in their own process because the backend is fixed at load. The file deletes its database before a dynamic `import("../mempg")` (Bun opens the file when mempg loads) and throws unless `MEMPG_BACKEND=sqlite` with a `/tmp` path. Its fake Ollama is bag-of-words plus synonyms. Wait for embeds with `settleEmbeddings()`; don't orchestrate HTTP timing - awaited SQLite queries do not let pending fetches progress, so polling for an embed write never ends. Test a late embed by calling `embedAndStore` directly.
 - **Hybrid tests** skip unless Ollama is reachable and the `embedding` column exists. A reachable Ollama without the model makes them time out. Pull the model, or set `MEMPG_OLLAMA_PORT=1`.
 - **The last test closes the shared pool.** Never add DB tests after it. `afterAll` cleans `/tmp/mempg-test%` projects with its own client.
 - **Where tests go**: nested describes under `"DB access layer"`. Factory tests go in `"omp extension"`, which uses a fake `ExtensionAPI` and never fires `session_shutdown`.
 - **Isolation rules for new tests**:
   - Use a `/tmp/mempg-test-…` project, deleted in `finally` along with `invalidateInjection(dir)`.
-  - The DB may hold a real corpus. Use unique markers like `` `zzz<name>${Date.now()}` ``.
-  - Restore module globals in `finally`: `setInjectionMode`, `setOllamaBase`, `setLogSink`.
+  - Use unique markers like `` `zzz<name>${Date.now()}` `` so tests don't collide.
+  - `__internals.consolidate()` is whole-store (no project filter), and many tests call it. `bun test` must only ever target a throwaway DB, or it deletes real near-duplicates.
+  - Restore module globals (`setInjectionMode`, `setOllamaBase`, `setLogSink`) in `finally`, or in the describe's `afterAll`.
   - Keyword-only assertions should force `setOllamaBase("http://127.0.0.1:9")`.
-  - Before asserting on async results, await `settleCaptures()` for captured rows and `untilEmbedded(id)` for embeddings.
+  - Before asserting on async results, await `settleCaptures()` for captured rows and `untilEmbedded(id)` for embeddings. The Postgres `untilEmbedded` returns a boolean on timeout instead of throwing, so always write `expect(await untilEmbedded(id)).toBe(true)`.
 - **Manual QA**:
   - Never use the live DB. Create a throwaway database, run `01-init.sh` against it, and export `MEMPG_*` before importing.
+  - `tests/mempg.test.ts` has no backend guard and defaults to `localhost:5432/mempg`, the live DB. Before `bun test`, point `MEMPG_*` at a throwaway DB bootstrapped by `01-init.sh`. Never run it on defaults or with `MEMPG_BACKEND=sqlite` exported (that hits the live `~/.omp/agent/mempg.db`).
+- **Test helpers** (top of `tests/mempg.test.ts`): `rawClient`, `inject`, `alive`, `purge` (delete + `invalidateInjection`), `storeId`, `withOllamaDown` (keyword-only), `withIsolatedMemoriesTable` (throwaway `search_path` schema for a truly empty table). `beforeAll` seeds `FIXTURE_PROJECT`.
+- **SQLite suite teardown** asserts no log lines except "embedding unavailable", so any new fire-and-forget log line fails it.
 
 ## Git / Release
 
 - **Branching**: never commit to `main`. The user merges and tags.
 - **Versioning**: bump the `package.json` version on the same branch as the release change, and tag the merge commit on `main`.
+- **Publish**: `publish.yml` runs on a `v*` tag under Node 24 (`npm publish`, OIDC). It re-checks tag = `package.json` version but runs no lint, typecheck or tests.
